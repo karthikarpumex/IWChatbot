@@ -1,0 +1,54 @@
+__pycache__/
+.venv/
+*.pyc
+*.pyo
+.env
+.DS_Store
+.idea/
+.vscode/
+env/
+.venv
+
+*.egg-info/
+*.log
+*.sqlite3
+*.db
+*.bak
+*.swp
+*.swo
+*.tmp
+*.orig
+*.coverage
+.mypy_cache/
+.pytest_cache/
+.cache/
+.pylint.d/
+.ipynb_checkpoints/
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Streamlit
+.streamlit/
+
+# Database
+*.db
+*.sqlite
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
