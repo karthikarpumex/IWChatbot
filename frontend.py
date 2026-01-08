@@ -2,120 +2,257 @@ import streamlit as st
 import requests
 import plotly.graph_objects as go
 import pandas as pd
-from datetime import datetime
+import uuid
+import time
 
-st.set_page_config(page_title="IronWorker Chatbot", page_icon="📊", layout="wide")
+st.set_page_config(page_title="IronWorker Analytics", page_icon="📊", layout="wide")
 
 BACKEND_URL = "http://localhost:8000"
 
-if "current_session" not in st.session_state:
-    st.session_state.current_session = None
+# Initialize simple session state
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 
 if "chat_messages" not in st.session_state:
     st.session_state.chat_messages = []
 
-if "load_history" not in st.session_state:
-    st.session_state.load_history = False
+if "conversation_history" not in st.session_state:
+    st.session_state.conversation_history = []
 
-with st.sidebar:
-    st.title("💬 Chat History")
-    
-    if st.button("🔄 Refresh Sessions"):
-        st.rerun()
-    
+if "current_conversation_title" not in st.session_state:
+    st.session_state.current_conversation_title = None
+
+if "session_loaded" not in st.session_state:
+    st.session_state.session_loaded = False
+
+if "new_chat_started" not in st.session_state:
+    st.session_state.new_chat_started = False
+
+# Load conversation history from backend on first load
+def load_session_from_backend(session_id):
+    """Load conversation history from backend database"""
     try:
-        response = requests.get(f"{BACKEND_URL}/sessions", timeout=5)
+        response = requests.get(f"{BACKEND_URL}/session/{session_id}", timeout=5)
         if response.status_code == 200:
-            sessions_data = response.json()
-            sessions = sessions_data.get("sessions", [])
-            
-            if sessions:
-                st.caption(f"📋 {len(sessions)} conversation(s)")
-                
-                for session in sessions:
-                    session_id = session["session_id"]
-                    first_question = session.get("first_question", "New conversation")
-                    if first_question:
-                        first_question = first_question[:50]
-                    else:
-                        first_question = "Empty conversation"
-                    
-                    message_count = session.get("message_count", 0)
-                    last_message = session.get("last_message_at", "")
-                    
-                    try:
-                        dt = datetime.fromisoformat(last_message.replace('Z', '+00:00'))
-                        time_str = dt.strftime("%b %d, %I:%M %p")
-                    except:
-                        time_str = "Unknown"
-                    
-                    col1, col2 = st.columns([4, 1])
-                    with col1:
-                        if st.button(
-                            f"💬 {first_question}",
-                            key=f"session_{session_id}",
-                            help=f"{message_count} messages • {time_str}"
-                        ):
-                            st.session_state.current_session = session_id
-                            st.session_state.load_history = True
-                            st.rerun()
-                    
-                    with col2:
-                        if st.button("🗑️", key=f"delete_{session_id}", help="Delete"):
-                            try:
-                                requests.delete(f"{BACKEND_URL}/session/{session_id}")
-                                if st.session_state.current_session == session_id:
-                                    st.session_state.current_session = None
-                                    st.session_state.chat_messages = []
-                                st.rerun()
-                            except:
-                                st.error("Delete failed")
-                    
-                    st.divider()
-            else:
-                st.info("No conversations yet")
-        
-    except requests.exceptions.ConnectionError:
-        st.warning("⚠️ Backend offline")
+            session_data = response.json()
+            if session_data.get("messages"):
+                messages = []
+                for msg in session_data["messages"]:
+                    # Backend now returns rich message data
+                    msg_type = msg.get("type", "user")
+                    if msg_type == "user":
+                        messages.append({
+                            "role": "user", 
+                            "content": msg["content"]
+                        })
+                    elif msg_type == "assistant":
+                        # Build rich assistant message with all metadata
+                        assistant_msg = {
+                            "role": "assistant", 
+                            "content": msg["content"]
+                        }
+                        
+                        # Add rich metadata if available
+                        if msg.get("chart_data"):
+                            assistant_msg["chart_data"] = msg["chart_data"]
+                        if msg.get("sql_query"):
+                            assistant_msg["sql_query"] = msg["sql_query"]
+                        if msg.get("filtered_sql"):
+                            assistant_msg["filtered_sql"] = msg["filtered_sql"]
+                        if msg.get("data"):
+                            assistant_msg["data"] = msg["data"]
+                        if msg.get("execution_time"):
+                            assistant_msg["execution_time"] = msg["execution_time"]
+                            
+                        messages.append(assistant_msg)
+                    # Skip "summary" type messages for display
+                st.session_state.chat_messages = messages
+                st.session_state.current_conversation_title = messages[0]["content"][:50] if messages else None
+                return True
+        return False
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Failed to load session: {e}")
+        return False
+
+def get_available_sessions():
+    """Get list of available sessions from backend with caching"""
+    try:
+        # Use cached sessions if available and fresh (within 5 seconds)
+        if "cached_sessions" in st.session_state and "cache_time" in st.session_state:
+            if time.time() - st.session_state.cache_time < 5:
+                return st.session_state.cached_sessions
+        
+        # Fetch fresh data
+        cache_buster = int(time.time())
+        response = requests.get(f"{BACKEND_URL}/sessions?_={cache_buster}", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            sessions = data.get("sessions", [])
+            # Cache the results
+            st.session_state.cached_sessions = sessions
+            st.session_state.cache_time = time.time()
+            return sessions
+        return []
+    except Exception:
+        return []
+
+def delete_session(session_id):
+    """Delete a session from backend"""
+    try:
+        response = requests.delete(f"{BACKEND_URL}/session/{session_id}", timeout=5)
+        if response.status_code == 200:
+            return True
+        return False
+    except Exception:
+        return False
+
+# Load session on first run or if not loaded (but skip if new chat just started)
+if not st.session_state.session_loaded and not st.session_state.new_chat_started:
+    # Try to load current session from backend
+    if load_session_from_backend(st.session_state.session_id):
+        st.session_state.session_loaded = True
+    else:
+        # If no history for current session, try to get latest session
+        available_sessions = get_available_sessions()
+        if available_sessions:
+            # Use most recent session
+            latest_session = available_sessions[0]  # Sessions are ordered by last_message DESC
+            st.session_state.session_id = latest_session["session_id"]
+            load_session_from_backend(st.session_state.session_id)
+        st.session_state.session_loaded = True
+
+# Reset new chat flag after session loading logic
+if st.session_state.new_chat_started:
+    st.session_state.new_chat_started = False
+
+# Sidebar with business-focused navigation
+with st.sidebar:
+    st.title("🔧 IronWorker Chatbot")
+    st.markdown("### Chat Dashboard")
+    
+    # New chat button
+    new_chat_clicked = st.button("💬 New Chat", type="primary", use_container_width=True)
+    
+    if new_chat_clicked:
+        # Save current conversation if it has messages
+        if st.session_state.chat_messages:
+            # Get title from first user message
+            first_user_msg = next((msg["content"] for msg in st.session_state.chat_messages if msg.get("role") == "user"), "New Conversation")
+            title = first_user_msg[:50] + "..." if len(first_user_msg) > 50 else first_user_msg
+            
+            # Save to history
+            st.session_state.conversation_history.append({
+                "id": st.session_state.session_id,
+                "title": title,
+                "messages": st.session_state.chat_messages.copy(),
+                "timestamp": f"{len(st.session_state.conversation_history) + 1}"
+            })
+        
+        # Start new conversation
+        st.session_state.chat_messages = []
+        st.session_state.session_id = str(uuid.uuid4())
+        st.session_state.current_conversation_title = None
+        st.session_state.session_loaded = True  # Mark as loaded to prevent auto-loading
+        st.session_state.new_chat_started = True  # Flag to indicate new chat
+        
+        # Force page refresh with clearer feedback
+        st.success("🆕 Starting new chat session...")
+        st.info("✨ Chat cleared! Ask me anything about IronWorker data...")
+        time.sleep(0.5)  # Brief pause for visual feedback
+        st.rerun()
     
     st.divider()
-    if st.button("➕ New Chat", type="primary"):
-        st.session_state.current_session = None
-        st.session_state.chat_messages = []
-        st.rerun()
-
-st.title("📊 IronWorker Analytics")
-
-if st.session_state.load_history and st.session_state.current_session:
-    try:
-        response = requests.get(
-            f"{BACKEND_URL}/session/{st.session_state.current_session}",
-            timeout=5
-        )
-        if response.status_code == 200:
-            history = response.json()
-            messages = history.get("messages", [])
+    
+    # Backend Session Management
+    available_sessions = get_available_sessions()
+    
+    if available_sessions:
+        st.markdown("### 🗂️ Recent Sessions")
+        for session in available_sessions[:5]:  # Show last 5 sessions
+            session_id = session["session_id"]
+            title = session.get("first_question", "New Conversation")
+            msg_count = session.get("message_count", 0)
             
-            st.session_state.chat_messages = []
-            for msg in messages:
-                st.session_state.chat_messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"],
-                    "sql_query": msg.get("sql_query"),
-                    "filtered_sql": msg.get("filtered_sql"),
-                    "chart_data": msg.get("chart_data"),
-                    "result_count": msg.get("result_count"),
-                    "execution_time": msg.get("execution_time"),
-                    "error": msg.get("error"),
-                    "created_at": msg.get("created_at")
-                })
+            # Truncate title
+            display_title = title[:30] + "..." if len(title) > 30 else title
+            
+            # Create columns for session button and delete button
+            col1, col2 = st.columns([4, 1])
+            
+            with col1:
+                # Highlight current session
+                if session_id == st.session_state.session_id:
+                    st.markdown(f"**🟢 {display_title}** ({msg_count} msgs)")
+                else:
+                    if st.button(f"📄 {display_title} ({msg_count} msgs)", key=f"load_session_{session_id}", use_container_width=True):
+                        # Load selected session
+                        st.session_state.session_id = session_id
+                        if load_session_from_backend(session_id):
+                            st.session_state.session_loaded = True
+                            st.rerun()
+            
+            with col2:
+                # Don't allow deleting current active session
+                if session_id != st.session_state.session_id:
+                    if st.button("🗿️", key=f"delete_{session_id}", help="Delete session", use_container_width=True):
+                        # Delete session
+                        if delete_session(session_id):
+                            st.success(f"Session deleted!")
+                            # Clear any cached session data
+                            if "cached_sessions" in st.session_state:
+                                del st.session_state.cached_sessions
+                            # Force immediate refresh
+                            st.rerun()
+    
+    st.divider()
+    
+    # Conversation History
+    if st.session_state.conversation_history:
+        st.markdown("### Recent Chats")
         
-        st.session_state.load_history = False
-    except Exception as e:
-        st.error(f"Failed to load history: {e}")
-        st.session_state.load_history = False
+        # Remove duplicates and show last 5 conversations
+        seen_ids = set()
+        unique_conversations = []
+        for conv in reversed(st.session_state.conversation_history):
+            if conv['id'] not in seen_ids:
+                seen_ids.add(conv['id'])
+                unique_conversations.append(conv)
+            if len(unique_conversations) >= 5:
+                break
+        
+        for i, conv in enumerate(unique_conversations):
+            if st.button(f"📝 {conv['title']}", key=f"load_conv_{i}_{conv['id']}", use_container_width=True):
+                # Save current conversation before switching if it has messages
+                if st.session_state.chat_messages and st.session_state.session_id != conv['id']:
+                    first_user_msg = next((msg["content"] for msg in st.session_state.chat_messages if msg.get("role") == "user"), "New Conversation")
+                    title = first_user_msg[:50] + "..." if len(first_user_msg) > 50 else first_user_msg
+                    
+                    # Update or add current conversation
+                    existing_conv = next((c for c in st.session_state.conversation_history if c['id'] == st.session_state.session_id), None)
+                    if existing_conv:
+                        existing_conv['messages'] = st.session_state.chat_messages.copy()
+                        existing_conv['title'] = title
+                    else:
+                        st.session_state.conversation_history.append({
+                            "id": st.session_state.session_id,
+                            "title": title,
+                            "messages": st.session_state.chat_messages.copy(),
+                            "timestamp": f"{len(st.session_state.conversation_history) + 1}"
+                        })
+                
+                # Load selected conversation
+                st.session_state.chat_messages = conv['messages'].copy()
+                st.session_state.session_id = conv['id']
+                st.session_state.current_conversation_title = conv['title']
+                st.rerun()
+        
+        st.divider()
+
+st.title("📊 IronWorker Chatbot")
+
+# Simple welcome message for new users
+if not st.session_state.chat_messages:
+    st.info("👋 Welcome! Ask me anything about union members, training, certifications, or employment data. I'll provide detailed analytics and visualizations.")
 
 for i, message in enumerate(st.session_state.chat_messages):
     if message["role"] == "user":
@@ -125,44 +262,100 @@ for i, message in enumerate(st.session_state.chat_messages):
         with st.chat_message("assistant"):
             st.write(message["content"])
             
-            if message.get("filtered_sql"):
-                with st.expander("🔍 SQL Query"):
-                    st.code(message["filtered_sql"], language="sql")
+            # SQL query hidden for client demo
+            # if message.get("filtered_sql"):
+            #     with st.expander("🔍 SQL Query"):
+            #         st.code(message["filtered_sql"], language="sql")
             
             chart_data = message.get("chart_data")
             if chart_data and chart_data.get("chart_type"):
                 try:
                     chart_type = chart_data.get("chart_type")
-                    x_values = chart_data.get("x_values", [])
-                    y_values = chart_data.get("y_values", [])
                     
-                    if x_values and y_values:
-                        if chart_type == "bar":
-                            fig = go.Figure(data=[
-                                go.Bar(x=x_values, y=y_values, marker_color='steelblue')
-                            ])
-                        elif chart_type == "line":
-                            fig = go.Figure(data=[
-                                go.Scatter(x=x_values, y=y_values, mode='lines+markers')
-                            ])
-                        elif chart_type == "pie":
-                            fig = go.Figure(data=[
-                                go.Pie(labels=x_values, values=y_values, hole=0.3)
-                            ])
-                        else:
-                            fig = go.Figure(data=[
-                                go.Scatter(x=x_values, y=y_values, mode='markers')
-                            ])
+                    if chart_type == "table":
+                        # Display data in an enhanced table format
+                        st.subheader(chart_data.get("title", "Data Table"))
+                        if message.get("data"):
+                            df = pd.DataFrame(message["data"])
+                            st.dataframe(df, use_container_width=True, height=400)
+                            
+                            # Add download option for table data
+                            csv = df.to_csv(index=False)
+                            st.download_button(
+                                "⬇️ Download Table Data",
+                                csv,
+                                f"{chart_data.get('title', 'data').replace(' ', '_').lower()}.csv",
+                                "text/csv",
+                                key=f"table_download_{id(message)}"
+                            )
+                    elif chart_type == "multi_line":
+                        # Handle multi-line charts with series_data
+                        series_data = chart_data.get("series_data", {})
+                        x_values = chart_data.get("x_values", [])
                         
-                        fig.update_layout(
-                            title=chart_data.get("title", ""),
-                            xaxis_title=chart_data.get("x_label", ""),
-                            yaxis_title=chart_data.get("y_label", ""),
-                            height=400,
-                            template="plotly_white"
-                        )
+                        if series_data and x_values:
+                            fig = go.Figure()
+                            
+                            # Add each series as a separate line
+                            for series_name, y_values in series_data.items():
+                                fig.add_trace(go.Scatter(
+                                    x=x_values,
+                                    y=y_values,
+                                    mode='lines+markers',
+                                    name=series_name,
+                                    line=dict(width=3),
+                                    marker=dict(size=6)
+                                ))
+                            
+                            fig.update_layout(
+                                title=chart_data.get("title", "Multi-Line Chart"),
+                                xaxis_title=chart_data.get("x_label", ""),
+                                yaxis_title=chart_data.get("y_label", ""),
+                                height=500,
+                                template="plotly_white",
+                                legend=dict(
+                                    orientation="h",
+                                    yanchor="bottom",
+                                    y=1.02,
+                                    xanchor="right",
+                                    x=1
+                                ),
+                                hovermode='x unified'
+                            )
+                            
+                            st.plotly_chart(fig, use_container_width=True, key=f"chart_multiline_{i}_{id(message)}")
+                    else:
+                        # Handle regular chart types
+                        x_values = chart_data.get("x_values", [])
+                        y_values = chart_data.get("y_values", [])
                         
-                        st.plotly_chart(fig, use_container_width=True)
+                        if x_values and y_values:
+                            if chart_type == "bar":
+                                fig = go.Figure(data=[
+                                    go.Bar(x=x_values, y=y_values, marker_color='steelblue')
+                                ])
+                            elif chart_type == "line":
+                                fig = go.Figure(data=[
+                                    go.Scatter(x=x_values, y=y_values, mode='lines+markers')
+                                ])
+                            elif chart_type == "pie":
+                                fig = go.Figure(data=[
+                                    go.Pie(labels=x_values, values=y_values, hole=0.3)
+                                ])
+                            else:
+                                fig = go.Figure(data=[
+                                    go.Scatter(x=x_values, y=y_values, mode='markers')
+                                ])
+                            
+                            fig.update_layout(
+                                title=chart_data.get("title", ""),
+                                xaxis_title=chart_data.get("x_label", ""),
+                                yaxis_title=chart_data.get("y_label", ""),
+                                height=400,
+                                template="plotly_white"
+                            )
+                            
+                            st.plotly_chart(fig, use_container_width=True, key=f"chart_history_{i}_{id(message)}")
                 except Exception as e:
                     st.error(f"Chart error: {e}")
             
@@ -177,6 +370,7 @@ for i, message in enumerate(st.session_state.chat_messages):
 user_input = st.chat_input("Ask a question about members, training, certifications...")
 
 if user_input:
+    # Add user message to current conversation
     st.session_state.chat_messages.append({
         "role": "user",
         "content": user_input
@@ -188,10 +382,10 @@ if user_input:
     with st.chat_message("assistant"):
         with st.spinner("🤔 Thinking..."):
             try:
-                payload = {"question": user_input}
-                
-                if st.session_state.current_session:
-                    payload["session_id"] = st.session_state.current_session
+                payload = {
+                    "question": user_input,
+                    "session_id": st.session_state.session_id
+                }
                 
                 response = requests.post(
                     f"{BACKEND_URL}/query",
@@ -201,9 +395,6 @@ if user_input:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    
-                    if data.get("session_id"):
-                        st.session_state.current_session = data["session_id"]
                     
                     if data.get("error"):
                         error_msg = f"❌ Error: {data['error']}"
@@ -217,45 +408,100 @@ if user_input:
                         summary = data.get("summary", "Query completed successfully")
                         st.write(summary)
                         
-                        if data.get("filtered_sql"):
-                            with st.expander("🔍 SQL Query"):
-                                st.code(data["filtered_sql"], language="sql")
+                        # SQL query hidden for client demo
+                        # if data.get("filtered_sql"):
+                        #     with st.expander("🔍 SQL Query"):
+                        #         st.code(data["filtered_sql"], language="sql")
                         
                         chart_data = data.get("chart")
                         if chart_data and chart_data.get("chart_type"):
                             try:
-                                x_values = chart_data.get("x_values", [])
-                                y_values = chart_data.get("y_values", [])
+                                chart_type = chart_data["chart_type"]
                                 
-                                if x_values and y_values:
-                                    chart_type = chart_data["chart_type"]
+                                if chart_type == "table":
+                                    # Display data in enhanced table format
+                                    st.subheader(chart_data.get("title", "Data Table"))
+                                    if data.get("data"):
+                                        df = pd.DataFrame(data["data"])
+                                        st.dataframe(df, use_container_width=True, height=400)
+                                        
+                                        # Add download option
+                                        csv = df.to_csv(index=False)
+                                        st.download_button(
+                                            "⬇️ Download Table Data",
+                                            csv,
+                                            f"{chart_data.get('title', 'data').replace(' ', '_').lower()}.csv",
+                                            "text/csv",
+                                            key=f"new_table_download_{len(st.session_state.chat_messages)}"
+                                        )
+                                elif chart_type == "multi_line":
+                                    # Handle multi-line charts with series_data
+                                    series_data = chart_data.get("series_data", {})
+                                    x_values = chart_data.get("x_values", [])
                                     
-                                    if chart_type == "bar":
-                                        fig = go.Figure(data=[
-                                            go.Bar(x=x_values, y=y_values, marker_color='steelblue')
-                                        ])
-                                    elif chart_type == "line":
-                                        fig = go.Figure(data=[
-                                            go.Scatter(x=x_values, y=y_values, mode='lines+markers')
-                                        ])
-                                    elif chart_type == "pie":
-                                        fig = go.Figure(data=[
-                                            go.Pie(labels=x_values, values=y_values, hole=0.3)
-                                        ])
-                                    else:
-                                        fig = go.Figure(data=[
-                                            go.Scatter(x=x_values, y=y_values, mode='markers')
-                                        ])
+                                    if series_data and x_values:
+                                        fig = go.Figure()
+                                        
+                                        # Add each series as a separate line
+                                        for series_name, y_values in series_data.items():
+                                            fig.add_trace(go.Scatter(
+                                                x=x_values,
+                                                y=y_values,
+                                                mode='lines+markers',
+                                                name=series_name,
+                                                line=dict(width=3),
+                                                marker=dict(size=6)
+                                            ))
+                                        
+                                        fig.update_layout(
+                                            title=chart_data.get("title", "Multi-Line Chart"),
+                                            xaxis_title=chart_data.get("x_label", ""),
+                                            yaxis_title=chart_data.get("y_label", ""),
+                                            height=500,
+                                            template="plotly_white",
+                                            legend=dict(
+                                                orientation="h",
+                                                yanchor="bottom",
+                                                y=1.02,
+                                                xanchor="right",
+                                                x=1
+                                            ),
+                                            hovermode='x unified'
+                                        )
+                                        
+                                        st.plotly_chart(fig, use_container_width=True, key=f"chart_new_multiline_{len(st.session_state.chat_messages)}")
+                                else:
+                                    # Handle regular chart types
+                                    x_values = chart_data.get("x_values", [])
+                                    y_values = chart_data.get("y_values", [])
                                     
-                                    fig.update_layout(
-                                        title=chart_data.get("title", ""),
-                                        xaxis_title=chart_data.get("x_label", ""),
-                                        yaxis_title=chart_data.get("y_label", ""),
-                                        height=400,
-                                        template="plotly_white"
-                                    )
-                                    
-                                    st.plotly_chart(fig, use_container_width=True)
+                                    if x_values and y_values:
+                                        if chart_type == "bar":
+                                            fig = go.Figure(data=[
+                                                go.Bar(x=x_values, y=y_values, marker_color='steelblue')
+                                            ])
+                                        elif chart_type == "line":
+                                            fig = go.Figure(data=[
+                                                go.Scatter(x=x_values, y=y_values, mode='lines+markers')
+                                            ])
+                                        elif chart_type == "pie":
+                                            fig = go.Figure(data=[
+                                                go.Pie(labels=x_values, values=y_values, hole=0.3)
+                                            ])
+                                        else:
+                                            fig = go.Figure(data=[
+                                                go.Scatter(x=x_values, y=y_values, mode='markers')
+                                            ])
+                                        
+                                        fig.update_layout(
+                                            title=chart_data.get("title", ""),
+                                            xaxis_title=chart_data.get("x_label", ""),
+                                            yaxis_title=chart_data.get("y_label", ""),
+                                            height=400,
+                                            template="plotly_white"
+                                        )
+                                        
+                                        st.plotly_chart(fig, use_container_width=True, key=f"chart_new_regular_{len(st.session_state.chat_messages)}")
                             except Exception as e:
                                 st.error(f"Chart error: {e}")
                         
@@ -284,6 +530,7 @@ if user_input:
                             "sql_query": data.get("original_sql"),
                             "filtered_sql": data.get("filtered_sql"),
                             "chart_data": chart_data,
+                            "data": data.get("data", []),  # Add data to session state
                             "result_count": len(data.get("data", [])),
                             "execution_time": float(data.get("execution_time", "0").replace("s", ""))
                         })
@@ -322,16 +569,18 @@ if user_input:
 
 st.divider()
 
+# Business footer for client demo
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.caption("🔒 Role: Admin")
+    st.caption("🔒 Secure Access")
 
 with col2:
-    if st.session_state.current_session:
-        st.caption(f"💬 Session: {st.session_state.current_session[:8]}...")
-    else:
-        st.caption("💬 New conversation")
+    st.caption("📊 Real-time Analytics")
 
 with col3:
-    st.caption(f"📊 Messages: {len(st.session_state.chat_messages)}")
+    if len(st.session_state.chat_messages) > 0:
+        user_questions = len([msg for msg in st.session_state.chat_messages if msg.get("role") == "user"])
+        st.caption(f"💬 {user_questions} questions answered")
+    else:
+        st.caption("💬 Ready to help")
