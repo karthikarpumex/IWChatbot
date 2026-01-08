@@ -1,28 +1,97 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+"""
+IronWorker Union Chatbot Backend - UPDATED WITH CONVERSATIONSUMMARYBUFFERMEMORY
+Keeps existing workflow structure but adds smart memory management
+"""
+
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
-from typing import TypedDict, Literal, Optional, Any
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from typing import TypedDict, Literal, Optional, Any, Sequence
 import uvicorn 
 import clickhouse_connect
-import psycopg2
+from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 import os
 from datetime import datetime
 from dotenv import load_dotenv
-from langfuse import observe
-from langfuse.langchain import CallbackHandler
+from langfuse.langchain import CallbackHandler  
 import sqlglot
 from sqlglot import exp, parse_one, errors
 import uuid
+import json
+import time
+import math
+import threading
+from functools import wraps
+import logging
+
+# Optional logging_loki import
+try:
+    import logging_loki
+    LOKI_AVAILABLE = True
+except ImportError:
+    LOKI_AVAILABLE = False
+    print("⚠️  logging_loki not available - Loki logging disabled")
 
 load_dotenv()
+
+# ============== LOKI LOGGING SETUP ==============
+
+def setup_loki_logging():
+    """Setup Loki logging for application logs"""
+    handlers = [logging.StreamHandler()]
+    
+    if LOKI_AVAILABLE and os.getenv("ENABLE_LOKI_LOGGING", "true").lower() == "true":
+        try:
+            loki_url = os.getenv("LOKI_URL", "http://localhost:3100/loki/api/v1/push")
+            loki_handler = logging_loki.LokiHandler(
+                url=loki_url,
+                tags={"application": "iwchatbot", "environment": os.getenv("ENVIRONMENT", "dev")},
+                version="1",
+            )
+            handlers.append(loki_handler)
+            print("✅ Loki logging enabled")
+        except Exception as e:
+            print(f"⚠️  Loki logging disabled: {e}")
+    else:
+        print("ℹ️  Loki logging disabled (not available or not configured)")
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=handlers,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    return logging.getLogger("iwchatbot")
+
+logger = setup_loki_logging()
+
 app = FastAPI()
 
-langfuse_handler = CallbackHandler()
+# ============== PERFORMANCE OPTIMIZATIONS ==============
 
-def get_clickhouse_db():
-    return clickhouse_connect.get_client(
+pg_pool = None
+clickhouse_client = None
+
+def init_connection_pools():
+    """Initialize database connection pools"""
+    global pg_pool, clickhouse_client
+
+    pg_pool = pool.ThreadedConnectionPool(
+        minconn=2,
+        maxconn=10,
+        host=os.getenv("POSTGRES_HOST", "localhost"),
+        port=int(os.getenv("POSTGRES_PORT", "5432")),
+        database=os.getenv("POSTGRES_DB", "chat_history"),
+        user=os.getenv("POSTGRES_USER", "postgres"),
+        password=os.getenv("POSTGRES_PASSWORD", "postgres")
+    )
+    
+    clickhouse_client = clickhouse_connect.get_client(
         host=os.getenv("CLICKHOUSE_HOST", "localhost"),
         port=int(os.getenv("CLICKHOUSE_PORT", "8123")),
         username=os.getenv("CLICKHOUSE_USER", "default"),
@@ -30,166 +99,728 @@ def get_clickhouse_db():
         database=os.getenv("CLICKHOUSE_DATABASE", "iw_dev")
     )
 
+    logger.info("✅ Connection pools initialized")
+
+langfuse_handler = CallbackHandler()
+
+# ============== MIDDLEWARE ==============
+
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    trace_id = str(uuid.uuid4())
+    request.state.trace_id = trace_id
+    response = await call_next(request)
+    response.headers["X-Trace-ID"] = trace_id
+    return response
+
+# ============== NODE LOGGING DECORATOR ==============
+
+def log_node(node_name: str):
+    """Decorator to log individual LangGraph nodes"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(state: dict, **kwargs):
+            trace_id = state.get('trace_id')
+            logger.info(f"Node started: {node_name}", extra={
+                "node": node_name, "trace_id": trace_id, "event": "node_start"
+            })
+            start_time = time.time()
+            try:
+                result = func(state, **kwargs)
+                execution_time = time.time() - start_time
+                logger.info(f"Node completed: {node_name}", extra={
+                    "node": node_name, "trace_id": trace_id, 
+                    "execution_time": execution_time, "event": "node_success"
+                })
+                return result
+            except Exception as e:
+                execution_time = time.time() - start_time
+                logger.error(f"Node failed: {node_name}", extra={
+                    "node": node_name, "trace_id": trace_id, 
+                    "execution_time": execution_time, "error": str(e), "event": "node_error"
+                })
+                raise
+        return wrapper
+    return decorator
+
+# ============== DATABASE FUNCTIONS ==============
+
+def get_clickhouse_db():
+    global clickhouse_client
+    if clickhouse_client is None:
+        init_connection_pools()
+    return clickhouse_client
+
 def get_postgres_conn():
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=int(os.getenv("POSTGRES_PORT", "5433")),
-        database=os.getenv("POSTGRES_DB", "chat_history"),
-        user=os.getenv("POSTGRES_USER", "postgres"),
-        password=os.getenv("POSTGRES_PASSWORD", "postgres")
-    )
+    global pg_pool
+    if pg_pool is None:
+        init_connection_pools()
+    return pg_pool.getconn()
 
-def init_chat_tables():
+def release_postgres_conn(conn):
+    if pg_pool:
+        pg_pool.putconn(conn)
+
+# ============== POSTGRESQL PERMANENT STORAGE ==============
+
+def init_conversation_tables():
+    """Initialize PostgreSQL tables for conversation persistence"""
     conn = get_postgres_conn()
-    cur = conn.cursor()
-    
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS chat_sessions (
-            session_id UUID PRIMARY KEY,
-            user_id VARCHAR(255) NOT NULL,
-            user_role VARCHAR(50) NOT NULL,
-            local_union_id VARCHAR(50),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_message_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS chat_messages (
-            message_id SERIAL PRIMARY KEY,
-            session_id UUID NOT NULL REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
-            role VARCHAR(20) NOT NULL CHECK (role IN ('user', 'assistant')),
-            content TEXT NOT NULL,
-            sql_query TEXT,
-            filtered_sql TEXT,
-            chart_data JSONB,
-            result_count INTEGER,
-            execution_time FLOAT,
-            error TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_session_messages ON chat_messages(session_id, created_at)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions ON chat_sessions(user_id, created_at DESC)")
-    
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_messages (
+                id SERIAL PRIMARY KEY,
+                session_id VARCHAR(255) NOT NULL,
+                message_type VARCHAR(10) NOT NULL,
+                content TEXT NOT NULL,
+                sql_query TEXT,
+                filtered_sql TEXT,
+                chart_data JSONB,
+                result_data JSONB,
+                execution_time FLOAT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Add new columns if table already exists (migration)
+        for col_def in [
+            ("sql_query", "TEXT"),
+            ("filtered_sql", "TEXT"),
+            ("chart_data", "JSONB"),
+            ("result_data", "JSONB"),
+            ("execution_time", "FLOAT")
+        ]:
+            try:
+                cur.execute(f"ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS {col_def[0]} {col_def[1]}")
+            except Exception:
+                pass  # Column might already exist
+        
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversation_session 
+            ON conversation_messages(session_id, timestamp)
+        """)
+        
+        conn.commit()
+        cur.close()
+        logger.info("Conversation tables initialized with chart persistence")
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize conversation tables: {e}")
+    finally:
+        release_postgres_conn(conn)
 
-def create_chat_session(user_id: str, user_role: str, local_union_id: Optional[str] = None) -> str:
-    conn = get_postgres_conn()
-    cur = conn.cursor()
-    
-    session_id = str(uuid.uuid4())
-    cur.execute(
-        "INSERT INTO chat_sessions (session_id, user_id, user_role, local_union_id) VALUES (%s, %s, %s, %s)",
-        (session_id, user_id, user_role, local_union_id)
-    )
-    
-    conn.commit()
-    cur.close()
-    conn.close()
-    
-    return session_id
-
-def save_message(
-    session_id: str,
-    role: str,
+def save_to_permanent_storage(
+    session_id: str, 
+    message_type: str, 
     content: str,
-    sql_query: Optional[str] = None,
-    filtered_sql: Optional[str] = None,
-    chart_data: Optional[dict] = None,
-    result_count: Optional[int] = None,
-    execution_time: Optional[float] = None,
-    error: Optional[str] = None
+    sql_query: str = None,
+    filtered_sql: str = None,
+    chart_data: dict = None,
+    result_data: list = None,
+    execution_time: float = None
 ):
-    conn = get_postgres_conn()
-    cur = conn.cursor()
-    
-    import json
-    chart_json = json.dumps(chart_data) if chart_data else None
-    
-    cur.execute(
-        """INSERT INTO chat_messages 
-        (session_id, role, content, sql_query, filtered_sql, chart_data, result_count, execution_time, error)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-        (session_id, role, content, sql_query, filtered_sql, chart_json, result_count, execution_time, error)
-    )
-    
-    cur.execute(
-        "UPDATE chat_sessions SET last_message_at = CURRENT_TIMESTAMP WHERE session_id = %s",
-        (session_id,)
-    )
-    
-    conn.commit()
-    cur.close()
-    conn.close()
+    """Save message to PostgreSQL for permanent audit trail with rich metadata"""
+    try:
+        conn = get_postgres_conn()
+        cur = conn.cursor()
+        
+        # Convert dicts/lists to JSON strings
+        chart_json = json.dumps(chart_data) if chart_data else None
+        result_json = json.dumps(result_data[:100]) if result_data else None  # Limit to first 100 rows
+        
+        cur.execute("""
+            INSERT INTO conversation_messages 
+            (session_id, message_type, content, sql_query, filtered_sql, chart_data, result_data, execution_time) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (session_id, message_type, content, sql_query, filtered_sql, chart_json, result_json, execution_time))
+        
+        conn.commit()
+        cur.close()
+        logger.debug(f"Saved {message_type} message with chart_data={chart_data is not None} to permanent storage for session {session_id}")
+        
+    except Exception as e:
+        logger.warning(f"Failed to save message to permanent storage: {e}")
+    finally:
+        if 'conn' in locals():
+            release_postgres_conn(conn)
 
-def get_session_history(session_id: str, limit: int = 10) -> list[dict]:
-    conn = get_postgres_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    cur.execute(
-        """SELECT role, content, sql_query, filtered_sql, created_at
-        FROM chat_messages WHERE session_id = %s
-        ORDER BY created_at DESC LIMIT %s""",
-        (session_id, limit)
-    )
-    
-    messages = cur.fetchall()
-    cur.close()
-    conn.close()
-    
-    return [dict(msg) for msg in reversed(messages)]
+def load_from_permanent_storage(session_id: str) -> list[BaseMessage]:
+    """Load conversation history from PostgreSQL with rich context for AI messages"""
+    try:
+        conn = get_postgres_conn()
+        cur = conn.cursor()
+        
+        # Load content plus SQL/data for context reconstruction
+        cur.execute("""
+            SELECT message_type, content, sql_query, result_data, timestamp 
+            FROM conversation_messages 
+            WHERE session_id = %s 
+            ORDER BY timestamp ASC
+        """, (session_id,))
+        
+        db_messages = cur.fetchall()
+        cur.close()
+        
+        messages = []
+        for row in db_messages:
+            message_type, content, sql_query, result_data, timestamp = row
+            if message_type == 'human':
+                messages.append(HumanMessage(content=content))
+            elif message_type == 'ai':
+                # Reconstruct rich context for AI messages
+                rich_content = content
+                if sql_query:
+                    rich_content += f"\n\n[SQL executed: {sql_query}]"
+                if result_data:
+                    # result_data is stored as JSONB, parse if string
+                    data = result_data if isinstance(result_data, list) else json.loads(result_data) if result_data else []
+                    if len(data) <= 10:
+                        rich_content += f"\n[Data returned: {data}]"
+                    elif data:
+                        rich_content += f"\n[Data sample (first 3 of {len(data)}): {data[:3]}]"
+                messages.append(AIMessage(content=rich_content))
+            elif message_type == 'system':
+                messages.append(SystemMessage(content=content))
+        
+        logger.info(f"Loaded {len(messages)} messages from DB for session {session_id}")
+        return messages
+        
+    except Exception as e:
+        logger.warning(f"Failed to load session from DB: {e}")
+        return []
+    finally:
+        if 'conn' in locals():
+            release_postgres_conn(conn)
 
-def get_user_sessions(user_id: str, limit: int = 20) -> list[dict]:
-    conn = get_postgres_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    cur.execute(
-        """SELECT 
-            s.session_id, s.user_role, s.local_union_id, s.created_at, s.last_message_at,
-            COUNT(m.message_id) as message_count,
-            (SELECT content FROM chat_messages 
-             WHERE session_id = s.session_id AND role = 'user' 
-             ORDER BY created_at ASC LIMIT 1) as first_question
-        FROM chat_sessions s
-        LEFT JOIN chat_messages m ON s.session_id = m.session_id
-        WHERE s.user_id = %s
-        GROUP BY s.session_id
-        ORDER BY s.last_message_at DESC
-        LIMIT %s""",
-        (user_id, limit)
-    )
-    
-    sessions = cur.fetchall()
-    cur.close()
-    conn.close()
-    
-    return [dict(session) for session in sessions]
+# ============== CONVERSATION SUMMARY BUFFER MEMORY ==============
 
-def delete_session(session_id: str):
-    conn = get_postgres_conn()
-    cur = conn.cursor()
+class ConversationSummaryBufferMessageHistory(BaseChatMessageHistory, BaseModel):
+    """
+    Smart memory implementation that:
+    - Keeps last k messages in full detail
+    - Summarizes older messages into SystemMessage  
+    - Automatically saves to PostgreSQL
+    - Reconstructs from PostgreSQL on init
+    """
+    messages: list[BaseMessage] = Field(default_factory=list)
+    llm: ChatOpenAI = Field(default_factory=lambda: ChatOpenAI(model="gpt-4o", temperature=0))
+    k: int = Field(default=10)
+    session_id: str = Field(default="")
     
-    cur.execute("DELETE FROM chat_sessions WHERE session_id = %s", (session_id,))
+    class Config:
+        arbitrary_types_allowed = True
     
-    conn.commit()
-    cur.close()
-    conn.close()
+    def __init__(self, session_id: str, llm: ChatOpenAI = None, k: int = 10):
+        if llm is None:
+            llm = ChatOpenAI(model="gpt-4o", temperature=0)
+        
+        super().__init__(llm=llm, k=k, session_id=session_id)
+        
+        # Load from permanent storage on init for recovery
+        logger.info(f"Loading conversation history from database for session: {session_id}")
+        stored_messages = load_from_permanent_storage(session_id)
+        if stored_messages:
+            logger.info(f"Found {len(stored_messages)} messages in database - reconstructing memory")
+            # Reconstruct by adding messages (triggers summarization if needed)
+            for msg in stored_messages:
+                # Don't save again to DB during reconstruction
+                self._add_message_to_memory_only(msg)
+            logger.info(f"Reconstruction complete: {len(self.messages)} messages in memory (includes any summarization)")
+        else:
+            logger.info(f"No conversation history found in database for session: {session_id} - starting fresh")
+    
+    def _add_message_to_memory_only(self, message: BaseMessage) -> None:
+        """Add to memory without saving to DB (for reconstruction)"""
+        existing_summary = None
+        if len(self.messages) > 0 and isinstance(self.messages[0], SystemMessage):
+            existing_summary = self.messages.pop(0).content
+        
+        self.messages.append(message)
+        
+        if len(self.messages) > self.k:
+            logger.debug(f"Memory limit exceeded during reconstruction, summarizing")
+            messages_to_summarize = self.messages[:-self.k]
+            self.messages = self.messages[-self.k:]
+            new_summary = self._create_summary(existing_summary, messages_to_summarize)
+            self.messages = [SystemMessage(content=new_summary)] + self.messages
+    
+    def add_message(self, message: BaseMessage) -> None:
+        """
+        Add message with automatic summarization and PostgreSQL persistence.
+        Called automatically when new messages are added to conversation.
+        """
+        # Save to permanent storage immediately
+        message_type = 'human' if isinstance(message, HumanMessage) else 'ai' if isinstance(message, AIMessage) else 'system'
+        save_to_permanent_storage(self.session_id, message_type, message.content)
+        
+        # Check if we have existing summary
+        existing_summary = None
+        if len(self.messages) > 0 and isinstance(self.messages[0], SystemMessage):
+            logger.debug(">> Found existing summary")
+            existing_summary = self.messages.pop(0).content
+        
+        # Add new message
+        self.messages.append(message)
+        
+        # Check if we exceed limit
+        if len(self.messages) > self.k:
+            logger.info(f">> Found {len(self.messages)} messages, dropping {len(self.messages) - self.k} oldest messages")
+            
+            # Get messages to summarize
+            messages_to_summarize = self.messages[:-self.k]
+            
+            # Keep only recent k messages
+            self.messages = self.messages[-self.k:]
+            
+            # Create or update summary
+            new_summary = self._create_summary(existing_summary, messages_to_summarize)
+            
+            # Prepend summary
+            self.messages = [SystemMessage(content=new_summary)] + self.messages
+            
+            logger.info(f">> New summary created, now have 1 summary + {len(self.messages)-1} recent messages")
+    
+    def _create_summary(self, existing_summary: Optional[str], old_messages: list[BaseMessage]) -> str:
+        """Create or update conversation summary using LLM"""
+        
+        # Format messages for summarization
+        old_messages_formatted = "\n".join([
+            f"{'User' if isinstance(msg, HumanMessage) else 'Assistant'}: {msg.content}"
+            for msg in old_messages
+        ])
+        
+        # Create summary prompt
+        if existing_summary:
+            summary_prompt = ChatPromptTemplate.from_messages([
+                SystemMessagePromptTemplate.from_template(
+                    "Given the existing conversation summary and the new messages, "
+                    "generate a new summary of the conversation. Ensuring to maintain "
+                    "as much relevant information as possible about IronWorker database queries, "
+                    "SQL analysis, and data insights."
+                ),
+                HumanMessagePromptTemplate.from_template(
+                    "Existing conversation summary:\n{existing_summary}\n\n"
+                    "New messages:\n{old_messages}"
+                )
+            ])
+        else:
+            summary_prompt = ChatPromptTemplate.from_messages([
+                SystemMessagePromptTemplate.from_template(
+                    "Summarize the following conversation between a user and an IronWorker database assistant. "
+                    "Focus on: questions asked, SQL queries generated, data insights, and ongoing analysis."
+                ),
+                HumanMessagePromptTemplate.from_template(
+                    "Messages:\n{old_messages}"
+                )
+            ])
+        
+        try:
+            # Format and invoke LLM
+            formatted_messages = summary_prompt.format_messages(
+                existing_summary=existing_summary if existing_summary else "",
+                old_messages=old_messages_formatted
+            )
+            
+            new_summary = self.llm.invoke(formatted_messages)
+            logger.debug(f">> New summary: {new_summary.content[:100]}...")
+            return new_summary.content
+            
+        except Exception as e:
+            logger.error(f"Failed to create summary: {e}")
+            # Fallback to simple text truncation
+            return f"Previous conversation: {old_messages_formatted[:500]}..."
+    
+    def add_messages(self, messages: Sequence[BaseMessage]) -> None:
+        """Add multiple messages"""
+        for message in messages:
+            self.add_message(message)
+    
+    def clear(self) -> None:
+        """Clear the message history"""
+        self.messages = []
+        logger.info(f"Cleared memory for session {self.session_id}")
+
+# ============== CONVERSATION HISTORY STORE ==============
+
+# In-memory store for active conversation memories (thread-safe)
+conversation_memories: dict[str, ConversationSummaryBufferMessageHistory] = {}
+_memories_lock = threading.Lock()
+
+def get_conversation_memory(session_id: str, k: int = 10) -> ConversationSummaryBufferMessageHistory:
+    """
+    Get or create conversation memory for a session.
+    This integrates with your existing workflow.
+    Thread-safe implementation using lock.
+    """
+    with _memories_lock:
+        if session_id not in conversation_memories:
+            logger.info(f"Session {session_id} not in active memory - creating new ConversationSummaryBufferMemory")
+            conversation_memories[session_id] = ConversationSummaryBufferMessageHistory(
+                session_id=session_id,
+                llm=ChatOpenAI(model="gpt-4o", temperature=0),
+                k=k
+            )
+            # Log what was actually loaded (constructor handles DB loading internally)
+            loaded_memory = conversation_memories[session_id]
+            logger.info(f"Memory initialized for {session_id}: {len(loaded_memory.messages)} messages total (loaded from DB + reconstructed)")
+        else:
+            logger.info(f"Using existing conversation memory for session: {session_id} ({len(conversation_memories[session_id].messages)} messages)")
+        return conversation_memories[session_id]
+
+# ============== SYSTEM PROMPTS ==============
+
+def get_sql_system_prompt() -> str:
+    """Generate SQL system prompt with current date context"""
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    
+    return f"""You are an expert ClickHouse SQL query generator for the Ironworkers Union database.
+
+Today's date is {current_date}. 
+
+DATE AND YEAR HANDLING:
+======================
+- If user mentions a specific year (e.g., "in 2025", "for 2024"), use that year directly as integer
+- Only use today() or toYear(today()) when NO specific year is mentioned
+- For age calculations with specific year: use the year as integer, e.g., "2025 - toYear(dateofbirth)" NOT "toYear('2025-01-01')"
+- toYear() requires Date type, NOT string. Wrong: toYear('2025-01-01'). Right: 2025 or toYear(toDate('2025-01-01'))
+
+CRITICAL RULES - READ FIRST:
+============================
+1. **ONLY USE TABLES LISTED BELOW** - These are the ONLY 8 tables that exist. Do NOT invent or assume any other tables.
+2. If asked about data not available in the schema (e.g., employers, companies, contractors, jobs, projects), set cannot_answer=true and provide a helpful refusal_message.
+3. For ANY questions about people, members, individuals, or person information → use iw_dev.iw_contact08
+4. NEVER generate SQL for tables not explicitly listed in the schema below.
+
+LOCAL UNION CONTEXT:
+===================
+- Total local unions: 225 (ranging from '1' to '999')
+- localunionid is stored as STRING - always use quotes: localunionid = '433' NOT localunionid = 433
+- Example locals: '1', '3', '25', '63', '433', '782', '999'
+
+DATABASE SCHEMA:
+================
+
+TABLE: iw_dev.iw_contact08 (Master member table - PRIMARY - Use for ALL people/member queries)
+Columns:
+- userid (String): Unique member identifier
+- firstname (String): Member first name
+- lastname (String): Member last name
+- middlename (String): Member middle name
+- membernumber (String): Official member number
+- memberstatusname (String): Current status
+  VALUES: 'Active', 'Suspended', 'Inactive', 'Deceased', 'Revoked', 'Withdrawal Card Issued', 'Terminated', 'Transferred Out', 'Canceled Initiation', 'Pending Initiation', 'Pending Reinstatement', 'Canceled Reinstatement', 'Expelled', 'Forfeit'
+- localunionid (String): Local union identifier (e.g., '782')
+- statename (String): State name
+- city (String): City name
+- countryname (String): Country name
+- address1 (String): Street address line 1
+- address2 (String): Street address line 2
+- postalcode (String): Postal/ZIP code
+- email (String): Email address
+- dateofbirth (String): Date of birth in 'YYYY-MM-DD' format
+- classid (String): Member's classification 
+  VALUES: 'Journeyman', 'Apprentice', 'PENSIONER', 'PROBATIONARY', 'Trainee', 'Honorary', 'Lifetime Member', 'Military', 'UNKNOWN', 'LIFETIME SHOP'
+- skillid (String): Member skillset
+  VALUES: 'Ironworker', 'Shopman', 'Rodman', 'Structural Ironworker', '"A" Rodman', 'Welder', 'Finisher', 'Rigger,Machinery Mover & Erector', 'Fence Erector', 'Navy Yard Rigger', 'Sheeter', 'UNKNOWN', 'Pre Apprentice', 'Trainee'
+- sex (String): Gender ('M', 'F')
+- ethinicity (String): Ethnicity
+- membertypecode (String): Member type code
+- paidthru (DateTime64): Dues paid through date - use toDate(paidthru) for comparisons
+- paid_thru_text (String): Paid through as text
+- createddate (DateTime64): Member record creation date
+- lastupdateddate (DateTime64): Last update timestamp
+
+TABLE: iw_dev.drugtestrecords (Drug testing records)
+Columns:
+- active_latest_userid (String): Links to iw_contact08.userid
+- member_number__c (String): Member number for direct lookup
+- name (String): Record name
+- test_status__c (String): Test result status code
+  VALUES: 'C' (Completed/Negative), 'X' (Need to Test), 'I' (Ineligible)
+- drug_test_completion_date__c (String): Test date in 'YYYY-MM-DD' format
+- drug_retest_date__c (String): Scheduled retest date
+- local_union_number__c (String): Local union identifier
+
+DRUG TESTING STATUS INTERPRETATION (CRITICAL - always use these mappings):
+When displaying drug test results, calculate and show human-readable status:
+- 'C' + test within 1 year of today → 'Negative/Current' (Compliant)
+- 'C' + test older than 1 year → 'Negative/Expired' (Non-compliant)  
+- 'X' → 'Need to Test' (Non-compliant)
+- 'I' → 'Ineligible, retest required' (Non-compliant)
+
+Compliance calculation: Only 'Negative/Current' status is compliant.
+
+TABLE: iw_dev.member_course_history (Training course history)
+Columns:
+- active_latest_userid (String): Links to iw_contact08.userid
+- membernumber (String): Member number
+- coursename (String): Name of the course
+  POPULAR: 'OSHA Subpart R', 'Aerial and Scissor Lift (MEWP) Training', 'Fall Protection for Construction', 'Orientation for Ironworkers', 'Rigging for Ironworkers 1', 'Rigging for Ironworkers 2', 'Scaffold Erector & Dismantler', 'First Aid Training', 'CPR and AED Training', 'Forklift Operator Hazard Training'
+- passed (String): Whether member passed ('Y', 'N', 'Yes', 'No', or NULL)
+- startdate (String): Course start date 'YYYY-MM-DD'
+- enddate (String): Course end date 'YYYY-MM-DD'
+- year (String): Year of the course as string
+- hours (String): Training hours
+- grade (String): Grade received
+- instructor (String): Instructor name
+- location (String): Training location
+- semester (String): Semester
+
+TABLE: iw_dev.member_certifications (Member certifications)
+Columns:
+- active_latest_userid (String): Links to iw_contact08.userid
+- membernumber (String): Member number
+- certification_name__c (String): Name of certification
+  POPULAR: 'Ironworker's National WCP', 'Qualified Rigger', 'Crane Signaling Hand and Voice', 'OSHA 10 hour', 'OSHA 30 hour', 'OSHA Subpart R', 'Scaffold Erector/Dismantler', 'Aerial and Scissor lift (MEWP) Training', 'Fall Protection', 'First Aid', 'Forklift Safety'
+- code__c (String): Certification code
+- create_date__c (String): Certification date 'YYYY-MM-DD'
+- expire_date__c (String): Expiration date 'YYYY-MM-DD'
+- jatc__c (String): JATC identifier
+- source__c (String): Certification source
+- definition__c (String): Certification definition
+
+TABLE: iw_dev.memberunionhistory1 (Union membership history)
+Columns:
+- active_latest_userid (String): Links to iw_contact08.userid
+- userid (String): Member user ID
+- membernumber (String): Member number
+- localunionid (String): Local union identifier
+- homelocal (String): Home local union
+- memberstatusname (String): Member status at that time
+- membertypecode (String): Member type code
+- skillname (String): Skill name at that time
+- classname (String): Class name at that time
+- paidthru (DateTime64): Paid through date - use toDate(paidthru) for comparisons
+- paid_thru_text (String): Paid through as text
+
+TABLE: iw_dev.member_national_fund_trainings (National fund training records)
+Columns:
+- active_latest_userid (String): Links to iw_contact08.userid
+- membernumber (String): Member number
+- coursecode (String): Course code
+- classname (String): Class name
+- startdate (String): Start date 'YYYY-MM-DD'
+- enddate (String): End date 'YYYY-MM-DD'
+- grade (String): Grade received
+- contacthours (String): Contact hours
+- instructor (String): Instructor name
+- location (String): Training location
+
+TABLE: iw_dev.trainingprogramcertificates (Advanced training certificates)
+Columns:
+- active_latest_userid (String): Links to iw_contact08.userid
+- membernumber (String): Member number
+- training_cert_name__c (String): Certificate name
+- code__c (String): Certificate code
+- cert_date__c (String): Certificate date 'YYYY-MM-DD'
+- expire_date__c (String): Expiration date 'YYYY-MM-DD'
+- jatc__c (String): JATC identifier
+- source__c (String): Certificate source
+
+TABLE: iw_dev.member_online_registration_courses (Online course registrations)
+Columns:
+- active_latest_userid (String): Links to iw_contact08.userid
+- membernumber (String): Member number
+- registerdate (String): Registration date 'YYYY-MM-DD'
+- confirmdate (String): Confirmation date 'YYYY-MM-DD'
+- grade (String): Grade received
+- hours (String): Course hours
+- passed (String): Whether passed
+- year (String): Year of registration
+
+BUSINESS LOGIC HELPERS:
+======================
+DUES STATUS:
+- Current: toDate(paidthru) >= today()
+- Delinquent: toDate(paidthru) < today()
+- Example: CASE WHEN toDate(paidthru) >= today() THEN 'Current' ELSE 'Delinquent' END AS dues_status
+
+MEMBER TENURE (years of membership):
+- toYear(today()) - toYear(createddate) AS years_of_membership
+
+ACTIVE MEMBERS (business definition):
+- memberstatusname = 'Active'
+
+DRUG TEST COMPLIANCE RATE:
+- (COUNT(CASE WHEN compliant THEN 1 END) * 100.0 / COUNT(*)) AS compliance_rate
+
+CERTIFICATION STATUS:
+- Valid: expire_date__c >= toString(today()) OR expire_date__c IS NULL OR expire_date__c = ''
+- Expired: expire_date__c < toString(today()) AND expire_date__c != ''
+
+SQL GENERATION RULES:
+====================
+1. **CRITICAL**: Always prefix table names with database: iw_dev.table_name (e.g., iw_dev.iw_contact08)
+2. **CRITICAL**: ONLY use columns explicitly listed in the schema above - NEVER assume columns exist
+3. **CRITICAL**: ONLY use the 8 tables listed above. NO OTHER TABLES EXIST (no employers, companies, contractors, jobs, projects, etc.)
+4. **CRITICAL**: Always use iw_contact08 as the primary table when member/people info is needed
+5. String columns require single quotes: localunionid = '782' NOT localunionid = 782
+6. For DateTime64 columns (paidthru, createddate, lastupdateddate), use toDate() for date comparisons
+7. For JOINs, always use: iw_dev.iw_contact08.userid = iw_dev.other_table.active_latest_userid
+8. Use ClickHouse SQL syntax (e.g., toString(), toDate(), formatDateTime())
+9. When filtering by local union, use the exact string value provided
+10. For counting, use COUNT(*) or COUNT(DISTINCT column)
+11. For aggregations by category, always include GROUP BY
+12. Inherit any filters mentioned in conversation history
+13. For follow-up questions about "his/her/their status", use the userid/active_latest_userid from the previous query result
+14. Limit results to 1000 rows unless user specifies otherwise
+15. Use LIKE with '%pattern%' for partial string matching (case-insensitive: use lower())
+16. Always alias aggregated columns (e.g., COUNT(*) AS total_count)
+17. Use ORDER BY for sorted results, specify ASC or DESC explicitly
+18. Use DISTINCT to remove duplicate rows when needed
+19. When joining multiple tables, specify table aliases for clarity
+20. For year comparisons in member_course_history, cast year column: toInt32(year) >= 2024 or year >= '2024'
+21. Always use proper type casting for numeric comparisons: toInt32(), toFloat64(), toString()
+
+NULL AND ERROR HANDLING:
+=======================
+- Always use COALESCE(column, 'Unknown') for display fields that might be NULL
+- Use isNotNull(column) in WHERE when filtering out NULLs
+- Empty strings are different from NULL: column != '' AND column IS NOT NULL
+- For optional date fields, check: column IS NOT NULL AND column != ''
+- Use ifNull(column, default_value) for calculations with potentially NULL values
+
+PERFORMANCE TIPS:
+================
+- For large aggregations, avoid SELECT * with JOIN - select only needed columns
+- Use LIMIT in subqueries when possible
+- For DateTime64 columns, use toDate(column) for date-only comparisons
+- Prefer COUNT(*) over COUNT(column) when counting rows
+- Use PREWHERE for simple filter conditions on large tables
+
+COMMON QUERY PATTERNS:
+=====================
+- Count members by status: SELECT memberstatusname, COUNT(*) AS count FROM iw_dev.iw_contact08 GROUP BY memberstatusname ORDER BY count DESC
+- Find members in a local union: SELECT firstname, lastname, membernumber, memberstatusname FROM iw_dev.iw_contact08 WHERE localunionid = '782' LIMIT 1000
+- Join with certifications: SELECT c.firstname, c.lastname, cert.certification_name__c FROM iw_dev.iw_contact08 c JOIN iw_dev.member_certifications cert ON c.userid = cert.active_latest_userid
+- Filter by date range: WHERE create_date__c >= '2024-01-01' AND create_date__c <= '2024-12-31'
+- Search by name: WHERE lower(firstname) LIKE '%john%' OR lower(lastname) LIKE '%smith%'
+- Dues status check: SELECT firstname, lastname, CASE WHEN toDate(paidthru) >= today() THEN 'Current' ELSE 'Delinquent' END AS dues_status FROM iw_dev.iw_contact08 WHERE localunionid = '782'
+- Drug testing compliance: SELECT CASE WHEN test_status__c = 'C' AND toDate(drug_test_completion_date__c) >= today() - INTERVAL 1 YEAR THEN 'Negative/Current' WHEN test_status__c = 'C' THEN 'Negative/Expired' WHEN test_status__c = 'X' THEN 'Need to Test' WHEN test_status__c = 'I' THEN 'Ineligible' ELSE COALESCE(test_status__c, 'Unknown') END AS status, COUNT(*) AS count FROM iw_dev.drugtestrecords WHERE drug_test_completion_date__c IS NOT NULL AND drug_test_completion_date__c != '' GROUP BY status
+- Training trends by year: SELECT coursename, toInt32(year) AS course_year, COUNT(*) AS enrollments FROM iw_dev.member_course_history WHERE toInt32(year) >= 2020 GROUP BY coursename, course_year ORDER BY course_year DESC, enrollments DESC LIMIT 100
+
+OUTPUT FORMAT:
+=============
+Return a JSON object with:
+- sql: The ClickHouse SQL query (empty string if cannot_answer is true)
+- tables: Array of table names used in the query (empty array if cannot_answer is true)
+- year: Year filter if applicable (for date validation)
+- can_chart: Boolean indicating if results are suitable for charting
+- chart_context: Create a brief context for charting based on the user prompt
+- cannot_answer: Boolean - set to TRUE if the question asks about data NOT in the schema (e.g., employers, companies, contractors, jobs, projects)
+- refusal_message: If cannot_answer is true, provide a helpful message like "I cannot answer this question as employer/company data is not available in the database. I can help with member information, certifications, drug tests, and training records."
+"""
+
+CHART_SYSTEM_PROMPT = """You are a data analyst that creates chart configurations and summaries from query results.
+
+Your task is to analyze the provided data and create an appropriate visualization configuration.
+
+CHART TYPE SELECTION RULES:
+==========================
+1. BAR CHART: Use for comparing categories or discrete values
+   - Member counts by status, location, or category
+   - Aggregated totals across groups
+   
+2. LINE CHART: Use for time-series or trend data with single series
+   - Changes over months/years for one metric
+   - Historical patterns for single category
+   
+3. MULTI-LINE CHART: Use for multi-dimensional data with 3-8 series
+   - Multiple local unions over time
+   - Multiple categories across years/states
+   - Comparing trends between different groups
+   - When data has structure like [{category1, time_period, value}, {category2, time_period, value}]
+   
+4. PIE CHART: Use for showing composition/proportions
+   - Distribution percentages
+   - Part-to-whole relationships
+   - Best when 2-7 categories
+   
+5. SCATTER CHART: Use for showing relationships between two numeric values
+   - Correlation analysis
+   - Distribution patterns
+   
+6. TABLE: Use for complex data with 8+ series or detailed analysis
+   - Complex multi-dimensional data
+   - When precise values are more important than visual trends
+   - Data with many categories or time periods
+   - When chart would be cluttered
+
+MULTI-DIMENSIONAL DATA DETECTION:
+=================================
+1. Look for data patterns like:
+   - Multiple categories across time periods
+   - Different groups (unions, states, statuses) with same metrics
+   - Data that could be organized into multiple trend lines
+   
+2. Series count guidelines:
+   - 1-2 series: Use regular line/bar chart
+   - 3-8 series: Use multi_line chart for trends, table for detailed analysis
+   - 8+ series: Use table format
+   
+3. Multi-line chart structure:
+   - x_values: Common x-axis values (years, months, categories)
+   - series_data: {"Series Name": [y_values for each x_value]}
+   - Example: {"Local 377": [120, 135, 140], "Local 416": [98, 105, 110]}
+
+DATA FORMATTING RULES:
+=====================
+1. For regular charts:
+   - x_values: Array of strings for category labels or x-axis values
+   - y_values: Array of numbers for the measurements
+   
+2. For multi_line charts:
+   - x_values: Common x-axis values (e.g., years: ["2022", "2023", "2024"])
+   - series_data: Dictionary mapping series names to their y-values
+   - y_values: Can be empty or contain aggregated values
+   
+3. For table charts:
+   - x_values and y_values can be empty
+   - Focus on comprehensive summary
+   
+4. Ensure data consistency and limit to top 15 categories for readability
+5. For pie charts, y_values should be positive numbers
+
+SUMMARY GUIDELINES:
+==================
+1. Always provide a clear, concise summary of what the data shows
+2. Highlight key insights (highest/lowest values, notable patterns, trends)
+3. For multi-dimensional data, mention key comparisons between series
+4. Include total counts when relevant
+5. Keep summary under 4 sentences
+6. Focus on the data insights, not on chart availability
+
+OUTPUT FORMAT:
+=============
+Return a JSON object with:
+- chart_type: 'bar', 'line', 'pie', 'scatter', 'multi_line', 'table', or null if no chart needed
+- title: Descriptive chart title
+- x_label: Label for x-axis
+- y_label: Label for y-axis  
+- x_values: Array of string labels (common axis for multi_line)
+- y_values: Array of numeric values (for single series charts)
+- series_data: Dictionary of series_name -> y_values (for multi_line charts only)
+- summary: Text summary of the data insights
+"""
+
+# ============== CONSTANTS ==============
+
+# Use current year for dynamic date validation
+_CURRENT_YEAR = datetime.now().year
 
 TABLE_DATES = {
-    "drugtestrecords": (2015, 2025),
-    "member_course_history": (1956, 2025),
-    "member_national_fund_trainings": (1985, 2025),
-    "memberunionhistory1": (1986, 2025),
+    "drugtestrecords": (2015, _CURRENT_YEAR),
+    "member_course_history": (1956, _CURRENT_YEAR),
+    "member_national_fund_trainings": (1985, _CURRENT_YEAR),
+    "memberunionhistory1": (1986, _CURRENT_YEAR),
     "member_certifications": (1900, 2241),
-    "member_online_registration_courses": (2012, 2025),
-    "trainingprogramcertificates": (2006, 2025),
+    "member_online_registration_courses": (2012, _CURRENT_YEAR),
+    "trainingprogramcertificates": (2006, _CURRENT_YEAR),
 }
 
-SENSITIVE_COLUMNS = {"ssn", "sin", "phone1", "phone4"}
+SENSITIVE_COLUMNS = {"ssn", "sin", "ssn__c", "phone1", "phone4", "phone_4", "emergencynumber", "address1", "address2", "postalcode"}
 
 class UserRole(BaseModel):
     role: Literal["admin", "local_union_officer", "ironworker"]
@@ -214,6 +845,8 @@ MEMBER_TABLE_FIELDS = {
     "member_online_registration_courses": "active_latest_userid",
     "trainingprogramcertificates": "active_latest_userid",
 }
+
+# ============== SQL FILTERING FUNCTIONS ==============
 
 def predicate_exists(expression: exp.Expression, column: str, value: str) -> bool:
     column = column.lower()
@@ -332,25 +965,32 @@ def redact_rows(rows: list[dict[str, Any]], denied_columns: set[str]) -> list[di
         return rows
     return [{k: v for k, v in row.items() if k.lower() not in denied_columns} for row in rows]
 
+# ============== MODELS ==============
+
 class SQLQuery(BaseModel):
-    sql: str
-    tables: list[str]
+    sql: str = ""  # Empty if cannot_answer is True
+    tables: list[str] = []
     year: str | None = None
     can_chart: bool = True
+    chart_context: str | None = None
+    cannot_answer: bool = False  # Set to True if the question cannot be answered with available data
+    refusal_message: str | None = None  # Explanation when cannot_answer is True
 
 class ChartData(BaseModel):
-    chart_type: Literal["bar", "line", "pie", "scatter"] | None = None
+    chart_type: Literal["bar", "line", "pie", "scatter", "multi_line", "table"] | None = None
     title: str = ""
     x_label: str = ""
     y_label: str = ""
     x_values: list[str] = []
     y_values: list[int | float] = []
+    series_data: dict[str, list[int | float]] | None = None  # For multi-line charts: {"series_name": [values]}
     summary: str
 
 class State(TypedDict):
     question: str
     user_role: UserRole
     session_id: str
+    trace_id: str
     sql_query: SQLQuery | None
     filtered_sql: str | None
     filter_metadata: dict | None
@@ -360,76 +1000,171 @@ class State(TypedDict):
     data: list[dict]
     chart: ChartData | None
     denied_columns: set[str]
-    conversation_history: list[dict]
+    chart_context: str | None
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
-sql_agent = llm.with_structured_output(SQLQuery)
-chart_agent = llm.with_structured_output(ChartData)
+# ============== LLM AGENTS (UPDATED WITH MEMORY) ==============
 
-@observe(name="sql-agent")
-def call_sql_agent(prompt: str) -> SQLQuery:
-    return sql_agent.invoke(prompt, config={"callbacks": [langfuse_handler]})
-
-@observe(name="chart-agent")
-def call_chart_agent(prompt: str) -> ChartData:
-    return chart_agent.invoke(prompt, config={"callbacks": [langfuse_handler]})
-
-def build_context_string(history: list[dict]) -> str:
-    if not history:
-        return ""
+def call_sql_agent(prompt: str, trace_id: str = None, conversation_messages: list[BaseMessage] = None) -> SQLQuery:
+    """Generate SQL with Langfuse logging and optional conversation context"""
     
-    context_parts = []
-    for msg in history[-6:]:
-        role = msg.get('role', 'unknown')
-        content = msg.get('content', '')
-        
-        if role == 'user':
-            context_parts.append(f"User asked: {content}")
-        elif role == 'assistant':
-            sql = msg.get('filtered_sql') or msg.get('sql_query')
-            if sql:
-                context_parts.append(f"Assistant queried: {sql[:200]}...")
-            context_parts.append(f"Assistant replied: {content[:200]}...")
-    
-    return "\n".join(context_parts)
+    if conversation_messages:
+        messages = conversation_messages
+    else:
+        messages = [
+            SystemMessage(content=get_sql_system_prompt()),
+            HumanMessage(content=prompt)
+        ]
 
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    sql_agent = llm.with_structured_output(SQLQuery)
+    
+    result = sql_agent.invoke(
+         messages,
+         config={
+            "callbacks": [langfuse_handler],
+            "run_name": "sql-generation"
+         }
+    )
+    
+    logger.info("SQL query generated", extra={
+        "trace_id": trace_id, "sql_preview": result.sql[:100],
+        "tables": result.tables, "can_chart": result.can_chart,
+        "has_conversation_context": bool(conversation_messages)
+    })
+    
+    return result
+
+def call_chart_agent(prompt: str, trace_id: str = None) -> ChartData:
+    """Generate chart with Langfuse logging"""
+    messages = [
+        SystemMessage(content=CHART_SYSTEM_PROMPT),
+        HumanMessage(content=prompt)
+    ]
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    chart_agent = llm.with_structured_output(ChartData)
+    
+    result = chart_agent.invoke(
+        messages,
+        config={
+            "callbacks": [langfuse_handler],
+            "run_name": "chart-generation",
+            "metadata": {"trace_id": trace_id}
+        }
+    )
+    
+    logger.info("Chart configuration generated", extra={
+        "trace_id": trace_id, "chart_type": result.chart_type,
+        "title": result.title, "data_points": len(result.x_values)
+    })
+    
+    return result
+
+# ============== HELPER FUNCTIONS ==============
+
+def sanitize_json_data(obj):
+    """Recursively sanitize data for JSON serialization"""
+    if isinstance(obj, dict):
+        return {key: sanitize_json_data(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_json_data(item) for item in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    else:
+        return obj
+
+def create_sql_prompt_with_history(question: str, messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Create SQL generation prompt with conversation history"""
+    system_message = SystemMessage(content=get_sql_system_prompt())
+    recent_messages = messages[-10:] if len(messages) > 10 else messages
+    current_question = HumanMessage(content=f"USER QUESTION: {question}\n\nGenerate the SQL query based on the schema and rules provided.")
+    return [system_message] + recent_messages + [current_question]
+
+# ============== WORKFLOW NODES (UPDATED WITH CONVERSATIONSUMMARYBUFFER) ==============
+
+@log_node("generate_sql")
 def generate_sql(state: State) -> State:
+    """Generate SQL using ConversationSummaryBufferMemory for smart context management"""
     base_question = state['question']
+    session_id = state['session_id']
     
-    context_section = ""
-    if state.get('conversation_history'):
-        context_str = build_context_string(state['conversation_history'])
-        if context_str:
-            context_section = f"""
-CONVERSATION HISTORY:
-{context_str}
-
-Extract relevant filters from history and apply to new query.
-"""
+    # Get conversation memory (with automatic summarization!)
+    conv_memory = get_conversation_memory(session_id, k=10)
     
-    prompt = f"""{context_section}Generate ClickHouse SQL for: {base_question}
-
-TABLES:
-- iw_contact08: Master (userid, firstname, lastname, membernumber, memberstatusname, localunionid, statename, city, email, dateofbirth)
-- drugtestrecords: Tests (active_latest_userid, test_status__c, drug_test_completion_date__c, local_union_number__c)
-- member_course_history: Training (active_latest_userid, coursename, passed, startdate, enddate, year)
-- member_certifications: Certs (active_latest_userid, certification_name__c, create_date__c, expire_date__c)
-- memberunionhistory1: History (active_latest_userid, memberstatusname, paidthru)
-- member_national_fund_trainings: National (active_latest_userid, coursecode, classname, startdate, enddate, grade)
-- trainingprogramcertificates: Advanced (active_latest_userid, training_cert_name__c, cert_date__c, expire_date__c)
-
-RULES:
-- Use iw_contact08 as primary
-- String columns need quotes: localunionid = '782'
-- Dates are STRING 'YYYY-MM-DD'
-- JOIN: iw_contact08.userid = other_table.active_latest_userid
-- Inherit filters from context
-
-OUTPUT: sql, tables, year, can_chart"""
+    # Get messages from memory (already includes summary if exists)
+    conversation_messages = conv_memory.messages
     
-    state['sql_query'] = call_sql_agent(prompt)
+    if conversation_messages:
+        logger.info(f"Using ConversationSummaryBufferMemory for session {session_id} ({len(conversation_messages)} messages)")
+        
+        # Check if first message is a summary
+        has_summary = isinstance(conversation_messages[0], SystemMessage) if conversation_messages else False
+        if has_summary:
+            logger.info(f">> Memory includes summary + {len(conversation_messages)-1} recent messages")
+        
+        # Create SQL prompt with memory context
+        sql_prompt_messages = create_sql_prompt_with_history(base_question, conversation_messages)
+        
+        # Generate SQL with context
+        state['sql_query'] = call_sql_agent(
+            prompt=f"USER QUESTION: {base_question}\n\nGenerate SQL with conversation context.",
+            trace_id=state.get('trace_id'),
+            conversation_messages=sql_prompt_messages
+        )
+        
+        # Handle refusal case - question cannot be answered with available data
+        if state['sql_query'] and state['sql_query'].cannot_answer:
+            refusal_msg = state['sql_query'].refusal_message or "I cannot answer this question as that data is not available in the database."
+            state['error'] = refusal_msg
+            state['sql_query'] = None
+            logger.info(f"Query refused: {refusal_msg}", extra={"trace_id": state.get('trace_id')})
+            return state
+        
+        # Set chart context from the SQL query result
+        if state['sql_query'] and state['sql_query'].chart_context:
+            state['chart_context'] = state['sql_query'].chart_context
+        else:
+            # Generate basic chart context from the question
+            state['chart_context'] = f"Chart visualization for: {base_question}"
+        
+        logger.info("SQL generation with conversation context", extra={
+            "trace_id": state.get('trace_id'), 
+            "conversation_messages": len(conversation_messages),
+            "has_summary": has_summary,
+            "session_id": session_id
+        })
+    else:
+        # No history - first message
+        state['sql_query'] = call_sql_agent(
+            f"""USER QUESTION: {base_question}
+
+Generate the SQL query based on the schema and rules provided.""",
+            state.get('trace_id')
+        )
+        
+        # Handle refusal case - question cannot be answered with available data
+        if state['sql_query'] and state['sql_query'].cannot_answer:
+            refusal_msg = state['sql_query'].refusal_message or "I cannot answer this question as that data is not available in the database."
+            state['error'] = refusal_msg
+            state['sql_query'] = None
+            logger.info(f"Query refused: {refusal_msg}", extra={"trace_id": state.get('trace_id')})
+            return state
+        
+        # Set chart context from the SQL query result
+        if state['sql_query'] and state['sql_query'].chart_context:
+            state['chart_context'] = state['sql_query'].chart_context
+        else:
+            # Generate basic chart context from the question
+            state['chart_context'] = f"Chart visualization for: {base_question}"
+        
+        logger.info("SQL generation without conversation context (first message)", extra={
+            "trace_id": state.get('trace_id'), "session_id": session_id
+        })
+    
     return state
 
+@log_node("apply_rbac_filter")
 def apply_rbac_filter(state: State) -> State:
     if not state['sql_query']:
         return state
@@ -451,6 +1186,7 @@ def apply_rbac_filter(state: State) -> State:
     
     return state
 
+@log_node("validate_filter")
 def validate_filter(state: State) -> State:
     if not state['sql_query'] or not state['filtered_sql'] or state['error']:
         return state
@@ -460,6 +1196,7 @@ def validate_filter(state: State) -> State:
         ensure_required_predicates(select, state['user_role'])
         validated_sql = validate_and_format_clickhouse_sql(state['filtered_sql'])
         state['filtered_sql'] = validated_sql
+        logger.info(state['filtered_sql'], extra={"trace_id": state.get('trace_id')})
         state['validation_result'] = {'valid': True, 'issues': []}
     except ValueError as e:
         state['error'] = f"Validation failed: {str(e)}"
@@ -467,6 +1204,7 @@ def validate_filter(state: State) -> State:
     
     return state
 
+@log_node("validate_dates")
 def validate_dates(state: State) -> State:
     if state['error']:
         return state
@@ -488,6 +1226,7 @@ def validate_dates(state: State) -> State:
     state['date_valid'] = True
     return state
 
+@log_node("run_query")
 def run_query(state: State) -> State:
     if not state['date_valid'] or state['error']:
         return state
@@ -497,11 +1236,17 @@ def run_query(state: State) -> State:
         result = client.query(state['filtered_sql'])
         rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
         state['data'] = redact_rows(rows, state['denied_columns'])
+        logger.info("Query executed successfully", extra={
+            "trace_id": state.get('trace_id'), "row_count": len(state['data']),
+            "redacted_columns": len(state['denied_columns'])
+        })
+        logger.info(state['data'], extra={"trace_id": state.get('trace_id')})
     except Exception as e:
         state['error'] = f"Query failed: {str(e)}"
     
     return state
 
+@log_node("create_chart")
 def create_chart(state: State) -> State:
     if not state['data'] or state['error']:
         return state
@@ -509,19 +1254,25 @@ def create_chart(state: State) -> State:
     can_chart = state['sql_query'] and state['sql_query'].can_chart and len(state['data']) > 2
     columns = list(state['data'][0].keys()) if state['data'] else []
     
-    prompt = f"""Analyze data and provide response.
-Question: {state['question']}
-Columns: {columns}
-Data ({len(state['data'])} rows): {state['data'][:15]}
-Create chart: {can_chart}
-OUTPUT: ChartData JSON"""
+    user_prompt = f"""USER QUESTION: {state['question']}
+
+DATA INFO:
+- Columns: {columns}
+- Total rows: {len(state['data'])}
+- Full dataset: {state['data']}
+- Should create chart: {can_chart}
+- Should create chart based on the Chart context: {state.get('chart_context', 'N/A')}
+
+Analyze this data and provide the chart configuration and summary."""
     
     try:
-        state['chart'] = call_chart_agent(prompt)
+        state['chart'] = call_chart_agent(user_prompt, state.get('trace_id'))
     except Exception as e:
         state['error'] = f"Analysis failed: {str(e)}"
     
     return state
+
+# ============== WORKFLOW SETUP (YOUR ORIGINAL STRUCTURE) ==============
 
 workflow = StateGraph(State)
 workflow.add_node("sql", generate_sql)
@@ -547,21 +1298,40 @@ workflow.add_conditional_edges(
 workflow.add_edge("query", "chart")
 workflow.add_edge("chart", END)
 
+# Compile graph (NO checkpointer needed - memory is managed by ConversationSummaryBuffer)
 graph = workflow.compile()
+
+# ============== API MODELS ==============
 
 class Query(BaseModel):
     question: str
     session_id: Optional[str] = None
 
-@observe(name="chatbot-query")
-def run_chatbot_query(question: str, user_role: UserRole, session_id: str) -> dict:
-    denied_columns = set() if user_role.role == "admin" else SENSITIVE_COLUMNS
-    conversation_history = get_session_history(session_id, limit=10)
+# ============== MAIN WORKFLOW (UPDATED WITH MEMORY) ==============
+
+def run_chatbot_query(question: str, user_role: UserRole, session_id: str, trace_id: str) -> dict:
+    """Execute workflow with ConversationSummaryBufferMemory"""
     
+    denied_columns = set() if user_role.role == "admin" else SENSITIVE_COLUMNS
+    
+    # Get conversation memory (this will load from database if session not in active memory)
+    conv_memory = get_conversation_memory(session_id, k=10)
+    
+    # Log the loaded conversation context (safely check for summary)
+    has_summary = len(conv_memory.messages) > 0 and isinstance(conv_memory.messages[0], SystemMessage)
+    logger.info(f"Loaded conversation memory for session {session_id}: {len(conv_memory.messages)} messages", extra={
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "loaded_messages": len(conv_memory.messages),
+        "has_summary": has_summary
+    })
+    
+    # Execute workflow (SQL generation will use existing conversation history)
     result = graph.invoke({
         "question": question,
         "user_role": user_role,
         "session_id": session_id,
+        "trace_id": trace_id,
         "sql_query": None,
         "filtered_sql": None,
         "filter_metadata": None,
@@ -571,13 +1341,61 @@ def run_chatbot_query(question: str, user_role: UserRole, session_id: str) -> di
         "data": [],
         "chart": None,
         "denied_columns": denied_columns,
-        "conversation_history": conversation_history
+        "chart_context": None
     })
+    
+    # Save user question to permanent storage (simple - just text)
+    save_to_permanent_storage(session_id, "human", question)
+    
+    # Add to memory for context management
+    conv_memory._add_message_to_memory_only(HumanMessage(content=question))
+    
+    # Save assistant response with FULL rich metadata (chart, SQL, data)
+    if result.get('chart') and result['chart'].summary:
+        chart_data = result['chart'].model_dump() if result['chart'] else None
+        
+        # Save to permanent storage with all rich data
+        save_to_permanent_storage(
+            session_id=session_id,
+            message_type="ai",
+            content=result['chart'].summary,
+            sql_query=result['sql_query'].sql if result.get('sql_query') else None,
+            filtered_sql=result.get('filtered_sql'),
+            chart_data=chart_data,
+            result_data=result.get('data'),
+            execution_time=None  # Will be set by caller if needed
+        )
+        
+        # Add RICH context to memory so LLM knows what data was returned
+        # Include SQL query and key data points for proper conversation context
+        memory_content = result['chart'].summary
+        if result.get('sql_query') and result['sql_query'].sql:
+            memory_content += f"\n\n[SQL executed: {result['sql_query'].sql}]"
+        if result.get('data') and len(result['data']) <= 10:
+            # Include actual data for small result sets so LLM has context
+            memory_content += f"\n[Data returned: {result['data']}]"
+        elif result.get('data'):
+            # For larger results, include first few rows
+            memory_content += f"\n[Data sample (first 3 of {len(result['data'])}): {result['data'][:3]}]"
+        
+        conv_memory._add_message_to_memory_only(AIMessage(content=memory_content))
+        
+    elif result.get('error'):
+        # Save error response
+        save_to_permanent_storage(
+            session_id=session_id,
+            message_type="ai",
+            content=f"Error: {result['error']}"
+        )
+        conv_memory._add_message_to_memory_only(AIMessage(content=f"Error: {result['error']}"))
+    
     return result
 
 @app.post("/query")
-def process(q: Query):
+def process(q: Query, request: Request):
     start_time = datetime.now()
+    
+    trace_id = getattr(request.state, 'trace_id', str(uuid.uuid4()))
     
     user_role = UserRole(
         role="admin",
@@ -588,38 +1406,21 @@ def process(q: Query):
     if q.session_id:
         session_id = q.session_id
     else:
-        session_id = create_chat_session(
-            user_role.user_id,
-            user_role.role,
-            user_role.local_union_id
-        )
-    
-    save_message(session_id, "user", q.question)
+        session_id = str(uuid.uuid4())
     
     try:
-        result = run_chatbot_query(q.question, user_role, session_id)
+        result = run_chatbot_query(q.question, user_role, session_id, trace_id)
         duration = (datetime.now() - start_time).total_seconds()
         
         if result['error']:
-            save_message(session_id, "assistant", f"Error: {result['error']}", error=result['error'])
             return {"error": result['error'], "session_id": session_id}
         
         chart_data = result['chart'].model_dump() if result['chart'] else None
-        summary = chart_data.get('summary') if chart_data else "Query completed successfully"
+        summary = chart_data.get('summary') if chart_data else "Query completed"
         
-        save_message(
-            session_id,
-            "assistant",
-            summary,
-            sql_query=result['sql_query'].sql if result['sql_query'] else None,
-            filtered_sql=result['filtered_sql'],
-            chart_data=chart_data,
-            result_count=len(result['data']),
-            execution_time=duration
-        )
-        
-        return {
+        response_data = {
             "session_id": session_id,
+            "trace_id": trace_id,
             "original_sql": result['sql_query'].sql if result['sql_query'] else None,
             "filtered_sql": result['filtered_sql'],
             "summary": summary,
@@ -627,49 +1428,187 @@ def process(q: Query):
             "data": result['data'],
             "execution_time": f"{duration:.2f}s"
         }
+        
+        return sanitize_json_data(response_data)
     except Exception as e:
-        save_message(session_id, "assistant", f"Error: {str(e)}", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============== SESSION MANAGEMENT ENDPOINTS (UPDATED) ==============
+
 @app.get("/sessions")
-def get_sessions(user_id: Optional[str] = None):
-    if not user_id:
-        user_id = "cda977a7-7bc5-4007-9316-dc315a0037c0"
-    
-    sessions = get_user_sessions(user_id)
-    return {"sessions": sessions}
+def get_sessions():
+    """Return session info from permanent storage"""
+    try:
+        conn = get_postgres_conn()
+        cur = conn.cursor()
+        
+        cur.execute("""
+            SELECT session_id, 
+                   COUNT(*) as message_count,
+                   MIN(timestamp) as first_message,
+                   MAX(timestamp) as last_message,
+                   MIN(CASE WHEN message_type = 'human' THEN content END) as first_question
+            FROM conversation_messages 
+            GROUP BY session_id 
+            ORDER BY MAX(timestamp) DESC 
+            LIMIT 20
+        """)
+        
+        sessions = cur.fetchall()
+        cur.close()
+        
+        session_list = []
+        for row in sessions:
+            session_id, msg_count, first_msg, last_msg, first_q = row
+            session_list.append({
+                "session_id": session_id,
+                "message_count": msg_count,
+                "first_message": first_msg.isoformat() if first_msg else None,
+                "last_message": last_msg.isoformat() if last_msg else None,
+                "first_question": (first_q[:50] + "...") if first_q and len(first_q) > 50 else first_q
+            })
+        
+        return {
+            "message": "Sessions with ConversationSummaryBufferMemory",
+            "memory_type": "ConversationSummaryBufferMemory + PostgreSQL",
+            "active_memories": len(conversation_memories),
+            "sessions": session_list
+        }
+    except Exception as e:
+        logger.error(f"Failed to get sessions: {e}")
+        return {"error": str(e)}
+    finally:
+        if 'conn' in locals():
+            release_postgres_conn(conn)
 
 @app.get("/session/{session_id}")
-def get_session(session_id: str):
-    conn = get_postgres_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    cur.execute(
-        """SELECT message_id, role, content, sql_query, filtered_sql, chart_data, 
-        result_count, execution_time, error, created_at
-        FROM chat_messages WHERE session_id = %s ORDER BY created_at ASC""",
-        (session_id,)
-    )
-    
-    messages = cur.fetchall()
-    cur.close()
-    conn.close()
-    
-    return {"session_id": session_id, "messages": [dict(msg) for msg in messages]}
+def get_session_info(session_id: str):
+    """Get session info with full message details including charts for frontend rendering"""
+    try:
+        conn = get_postgres_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Get all messages with rich metadata
+        cur.execute("""
+            SELECT message_type, content, sql_query, filtered_sql, chart_data, result_data, execution_time, timestamp
+            FROM conversation_messages 
+            WHERE session_id = %s 
+            ORDER BY timestamp ASC
+        """, (session_id,))
+        
+        db_messages = cur.fetchall()
+        cur.close()
+        release_postgres_conn(conn)
+        
+        messages = []
+        for row in db_messages:
+            msg = {
+                "type": "user" if row["message_type"] == "human" else "assistant" if row["message_type"] == "ai" else "summary",
+                "content": row["content"]
+            }
+            
+            # Add rich metadata for assistant messages
+            if row["message_type"] == "ai":
+                if row.get("sql_query"):
+                    msg["sql_query"] = row["sql_query"]
+                if row.get("filtered_sql"):
+                    msg["filtered_sql"] = row["filtered_sql"]
+                if row.get("chart_data"):
+                    msg["chart_data"] = row["chart_data"]  # Already parsed from JSONB
+                if row.get("result_data"):
+                    msg["data"] = row["result_data"]  # Already parsed from JSONB
+                if row.get("execution_time"):
+                    msg["execution_time"] = row["execution_time"]
+            
+            messages.append(msg)
+        
+        # Also check active memory for current state
+        is_active = session_id in conversation_memories
+        
+        return {
+            "session_id": session_id,
+            "memory_type": "Active in memory" if is_active else "Loaded from PostgreSQL",
+            "total_messages": len(messages),
+            "messages": messages
+        }
+    except Exception as e:
+        logger.error(f"Failed to get session info: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/session/{session_id}")
-def remove_session(session_id: str):
-    delete_session(session_id)
-    return {"message": "Session deleted", "session_id": session_id}
+def clear_session_memory(session_id: str):
+    """Clear session from memory and permanent storage"""
+    try:
+        # Remove from active memory
+        if session_id in conversation_memories:
+            del conversation_memories[session_id]
+            logger.info(f"Removed session {session_id} from active memory")
+        
+        # Remove from permanent storage
+        conn = get_postgres_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM conversation_messages WHERE session_id = %s", (session_id,))
+        deleted_count = cur.rowcount
+        conn.commit()
+        cur.close()
+        
+        return {
+            "message": "Session cleared from both memory and permanent storage",
+            "session_id": session_id,
+            "deleted_messages": deleted_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if 'conn' in locals():
+            release_postgres_conn(conn)
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "features": ["rbac", "chat_storage", "langfuse"],
-        "db": {"clickhouse": "iw_dev", "postgres": "chat_history"}
+        "memory_system": "ConversationSummaryBufferMemory + PostgreSQL",
+        "features": [
+            "rbac",
+            "conversation_summary_buffer",
+            "automatic_summarization",
+            "postgresql_permanent_storage",
+            "langfuse"
+        ],
+        "active_memories": len(conversation_memories),
+        "db": {
+            "clickhouse": "iw_dev",
+            "postgres": "chat_history"
+        }
     }
 
+# ============== STARTUP/SHUTDOWN ==============
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize resources on startup"""
+    init_connection_pools()
+    init_conversation_tables()
+    logger.info("Application started successfully", extra={
+        "event": "startup", 
+        "features": ["connection_pooling", "conversation_summary_buffer_memory", "langfuse", "loki_logging"],
+        "memory_system": "ConversationSummaryBufferMemory (k=10) + PostgreSQL persistence"
+    })
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    global pg_pool, clickhouse_client
+    
+    if pg_pool:
+        pg_pool.closeall()
+    
+    if clickhouse_client:
+        clickhouse_client.close()
+    
+    logger.info("Application shutdown complete")
+
 if __name__ == "__main__":
-    init_chat_tables()
+    init_connection_pools()
+    init_conversation_tables()
     uvicorn.run(app, host="0.0.0.0", port=8000)
