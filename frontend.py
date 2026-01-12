@@ -83,8 +83,7 @@ def get_available_sessions():
                 return st.session_state.cached_sessions
         
         # Fetch fresh data
-        cache_buster = int(time.time())
-        response = requests.get(f"{BACKEND_URL}/sessions?_={cache_buster}", timeout=5)
+        response = requests.get(f"{BACKEND_URL}/sessions", timeout=5)
         if response.status_code == 200:
             data = response.json()
             sessions = data.get("sessions", [])
@@ -180,9 +179,9 @@ with st.sidebar:
             col1, col2 = st.columns([4, 1])
             
             with col1:
-                # Highlight current session
+                # Render session without green indicator for current session
                 if session_id == st.session_state.session_id:
-                    st.markdown(f"**🟢 {display_title}** ({msg_count} msgs)")
+                    st.markdown(f"**{display_title}** ({msg_count} msgs)")
                 else:
                     if st.button(f"📄 {display_title} ({msg_count} msgs)", key=f"load_session_{session_id}", use_container_width=True):
                         # Load selected session
@@ -260,26 +259,33 @@ for i, message in enumerate(st.session_state.chat_messages):
             st.write(message["content"])
     else:
         with st.chat_message("assistant"):
-            st.write(message["content"])
-            
-            # SQL query hidden for client demo
-            # if message.get("filtered_sql"):
-            #     with st.expander("🔍 SQL Query"):
-            #         st.code(message["filtered_sql"], language="sql")
-            
             chart_data = message.get("chart_data")
-            if chart_data and chart_data.get("chart_type"):
+            summary = chart_data.get("summary") if chart_data else None
+            chart_type = chart_data.get("chart_type") if chart_data else None
+
+            # Show summary unless it's a 'no chart needed' message and no chart is shown
+            suppress_phrases = [
+                "a chart is not necessary",
+                "no chart is necessary",
+                "not necessary to represent this information",
+                "no chart needed"
+            ]
+            show_summary = True
+            if summary and chart_type is None:
+                for phrase in suppress_phrases:
+                    if phrase in summary.lower():
+                        show_summary = False
+                        break
+            if summary and show_summary:
+                st.write(summary)
+
+            if chart_data and chart_type:
                 try:
-                    chart_type = chart_data.get("chart_type")
-                    
                     if chart_type == "table":
-                        # Display data in an enhanced table format
                         st.subheader(chart_data.get("title", "Data Table"))
                         if message.get("data"):
                             df = pd.DataFrame(message["data"])
                             st.dataframe(df, use_container_width=True, height=400)
-                            
-                            # Add download option for table data
                             csv = df.to_csv(index=False)
                             st.download_button(
                                 "⬇️ Download Table Data",
@@ -289,14 +295,10 @@ for i, message in enumerate(st.session_state.chat_messages):
                                 key=f"table_download_{id(message)}"
                             )
                     elif chart_type == "multi_line":
-                        # Handle multi-line charts with series_data
                         series_data = chart_data.get("series_data", {})
                         x_values = chart_data.get("x_values", [])
-                        
                         if series_data and x_values:
                             fig = go.Figure()
-                            
-                            # Add each series as a separate line
                             for series_name, y_values in series_data.items():
                                 fig.add_trace(go.Scatter(
                                     x=x_values,
@@ -306,7 +308,6 @@ for i, message in enumerate(st.session_state.chat_messages):
                                     line=dict(width=3),
                                     marker=dict(size=6)
                                 ))
-                            
                             fig.update_layout(
                                 title=chart_data.get("title", "Multi-Line Chart"),
                                 xaxis_title=chart_data.get("x_label", ""),
@@ -322,13 +323,10 @@ for i, message in enumerate(st.session_state.chat_messages):
                                 ),
                                 hovermode='x unified'
                             )
-                            
                             st.plotly_chart(fig, use_container_width=True, key=f"chart_multiline_{i}_{id(message)}")
                     else:
-                        # Handle regular chart types
                         x_values = chart_data.get("x_values", [])
                         y_values = chart_data.get("y_values", [])
-                        
                         if x_values and y_values:
                             if chart_type == "bar":
                                 fig = go.Figure(data=[
@@ -346,7 +344,6 @@ for i, message in enumerate(st.session_state.chat_messages):
                                 fig = go.Figure(data=[
                                     go.Scatter(x=x_values, y=y_values, mode='markers')
                                 ])
-                            
                             fig.update_layout(
                                 title=chart_data.get("title", ""),
                                 xaxis_title=chart_data.get("x_label", ""),
@@ -354,18 +351,12 @@ for i, message in enumerate(st.session_state.chat_messages):
                                 height=400,
                                 template="plotly_white"
                             )
-                            
                             st.plotly_chart(fig, use_container_width=True, key=f"chart_history_{i}_{id(message)}")
                 except Exception as e:
                     st.error(f"Chart error: {e}")
-            
-            if message.get("result_count") is not None or message.get("execution_time"):
-                metadata = []
-                if message.get("result_count") is not None:
-                    metadata.append(f"📊 {message['result_count']} rows")
-                if message.get("execution_time"):
-                    metadata.append(f"⏱️ {message['execution_time']:.2f}s")
-                st.caption(" • ".join(metadata))
+            # Only show execution time, not row count
+            if message.get("execution_time"):
+                st.caption(f"⏱️ {message['execution_time']:.2f}s")
 
 user_input = st.chat_input("Ask a question about members, training, certifications...")
 
@@ -492,16 +483,16 @@ if user_input:
                                             fig = go.Figure(data=[
                                                 go.Scatter(x=x_values, y=y_values, mode='markers')
                                             ])
-                                        
-                                        fig.update_layout(
-                                            title=chart_data.get("title", ""),
-                                            xaxis_title=chart_data.get("x_label", ""),
-                                            yaxis_title=chart_data.get("y_label", ""),
-                                            height=400,
-                                            template="plotly_white"
-                                        )
-                                        
-                                        st.plotly_chart(fig, use_container_width=True, key=f"chart_new_regular_{len(st.session_state.chat_messages)}")
+                                    
+                                    fig.update_layout(
+                                        title=chart_data.get("title", ""),
+                                        xaxis_title=chart_data.get("x_label", ""),
+                                        yaxis_title=chart_data.get("y_label", ""),
+                                        height=400,
+                                        template="plotly_white"
+                                    )
+                                    
+                                    st.plotly_chart(fig, use_container_width=True, key=f"chart_new_regular_{len(st.session_state.chat_messages)}")
                             except Exception as e:
                                 st.error(f"Chart error: {e}")
                         
