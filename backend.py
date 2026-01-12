@@ -18,7 +18,12 @@ from psycopg2.extras import RealDictCursor
 import os
 from datetime import datetime
 from dotenv import load_dotenv
-from langfuse.langchain import CallbackHandler  
+
+# Disable OpenTelemetry auto-instrumentation
+os.environ["OTEL_SDK_DISABLED"] = "true"
+
+# Import langfuse AFTER langchain (langfuse requires langchain to be available)
+from langfuse.callback import CallbackHandler
 import sqlglot
 from sqlglot import exp, parse_one, errors
 import uuid
@@ -101,8 +106,42 @@ def init_connection_pools():
 
     logger.info("✅ Connection pools initialized")
 
-langfuse_handler = CallbackHandler()
+# ============== LANGFUSE SETUP ==============
 
+def create_langfuse_handler():
+    """Create Langfuse handler with explicit configuration from environment"""
+    try:
+        secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+        public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+        # Support both LANGFUSE_HOST and LANGFUSE_BASE_URL
+        host = os.getenv("LANGFUSE_BASE_URL") or os.getenv("LANGFUSE_HOST", "http://localhost:3001")
+        
+        if not secret_key or not public_key:
+            logger.warning("⚠️  Langfuse keys not found - tracing disabled")
+            logger.warning(f"   LANGFUSE_SECRET_KEY: {'set' if secret_key else 'NOT SET'}")
+            logger.warning(f"   LANGFUSE_PUBLIC_KEY: {'set' if public_key else 'NOT SET'}")
+            return None
+        
+        # Set environment variables for Langfuse SDK (it reads from env automatically)
+        os.environ["LANGFUSE_SECRET_KEY"] = secret_key
+        os.environ["LANGFUSE_PUBLIC_KEY"] = public_key
+        os.environ["LANGFUSE_HOST"] = host
+        
+        # Create handler - it reads credentials from environment variables
+        handler = CallbackHandler()
+        
+        logger.info(f"✅ Langfuse handler initialized")
+        logger.info(f"   Host: {host}")
+        logger.info(f"   Public Key: {public_key[:20]}...")
+        return handler
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize Langfuse: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+
+# Initialize handler (will be None if config missing)
+langfuse_handler = create_langfuse_handler()
 # ============== MIDDLEWARE ==============
 
 @app.middleware("http")
@@ -477,7 +516,7 @@ def get_sql_system_prompt() -> str:
     
     return f"""You are an expert ClickHouse SQL query generator for the Ironworkers Union database.
 
-Today's date is {current_date}. 
+Today's date is {current_date}.
 
 DATE AND YEAR HANDLING:
 ======================
@@ -492,6 +531,10 @@ CRITICAL RULES - READ FIRST:
 2. If asked about data not available in the schema (e.g., employers, companies, contractors, jobs, projects), set cannot_answer=true and provide a helpful refusal_message.
 3. For ANY questions about people, members, individuals, or person information → use iw_dev.iw_contact08
 4. NEVER generate SQL for tables not explicitly listed in the schema below.
+
+LATEST ACTIVE USER ID RULE:
+==========================
+- When querying iw_contact08, always select records with the latest active user ID (active_latest_userid) and ensure the user IDs are distinct, unless the user requests otherwise.
 
 LOCAL UNION CONTEXT:
 ===================
@@ -543,14 +586,31 @@ Columns:
 - drug_retest_date__c (String): Scheduled retest date
 - local_union_number__c (String): Local union identifier
 
-DRUG TESTING STATUS INTERPRETATION (CRITICAL - always use these mappings):
-When displaying drug test results, calculate and show human-readable status:
-- 'C' + test within 1 year of today → 'Negative/Current' (Compliant)
-- 'C' + test older than 1 year → 'Negative/Expired' (Non-compliant)  
-- 'X' → 'Need to Test' (Non-compliant)
-- 'I' → 'Ineligible, retest required' (Non-compliant)
+DRUG TESTING STATUS INTERPRETATION (CRITICAL):
+==============================================
+The database tracks drug test COMPLIANCE, not pass/fail results.
+There is NO positive/failed result in the database - only compliance status.
 
-Compliance calculation: Only 'Negative/Current' status is compliant.
+Status codes:
+- 'C' = Completed (Negative result - member took test and passed)
+- 'X' = Need to Test (member hasn't taken required test)
+- 'I' = Ineligible (member needs to retest)
+
+When user says "failed drug test":
+- This means NON-COMPLIANT status: test_status__c IN ('X', 'I')
+- It does NOT mean a positive drug result (that data doesn't exist)
+
+When user says "in [year]" with drug tests:
+- Filter by: toYear(toDate(drug_test_completion_date__c)) = [year]
+- Do NOT add expiration logic when year is specified
+
+Correct pattern for "failed drug test in 2024":
+  WHERE test_status__c IN ('X', 'I')
+    AND toYear(toDate(drug_test_completion_date__c)) = 2024
+
+WRONG pattern (never do this):
+  WHERE (test_status__c IN ('X','I') OR toDate(...) < toDate('2024-01-01'))
+    AND toYear(...) = 2024  -- CONFLICT!
 
 TABLE: iw_dev.member_course_history (Training course history)
 Columns:
@@ -716,6 +776,10 @@ Return a JSON object with:
 CHART_SYSTEM_PROMPT = """You are a data analyst that creates chart configurations and summaries from query results.
 
 Your task is to analyze the provided data and create an appropriate visualization configuration.
+
+MONTH LABELING RULE:
+====================
+- When displaying months on charts or in summaries, always map numeric month values (1–12) to their full English month names (e.g., 1 = January, 2 = February, ..., 12 = December) for clarity and readability.
 
 CHART TYPE SELECTION RULES:
 ==========================
@@ -1018,18 +1082,25 @@ def call_sql_agent(prompt: str, trace_id: str = None, conversation_messages: lis
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
     sql_agent = llm.with_structured_output(SQLQuery)
     
-    result = sql_agent.invoke(
-         messages,
-         config={
-            "callbacks": [langfuse_handler],
-            "run_name": "sql-generation"
-         }
-    )
+    # Build config with optional Langfuse callback
+    config = {"run_name": "sql-generation"}
+    if langfuse_handler:
+        config["callbacks"] = [langfuse_handler]
+    
+    result = sql_agent.invoke(messages, config=config)
+    
+    # Flush Langfuse to ensure traces are sent
+    if langfuse_handler:
+        try:
+            langfuse_handler.flush()
+        except Exception as e:
+            logger.warning(f"Langfuse flush failed: {e}")
     
     logger.info("SQL query generated", extra={
-        "trace_id": trace_id, "sql_preview": result.sql[:100],
+        "trace_id": trace_id, "sql_preview": result.sql[:100] if result.sql else "empty",
         "tables": result.tables, "can_chart": result.can_chart,
-        "has_conversation_context": bool(conversation_messages)
+        "has_conversation_context": bool(conversation_messages),
+        "langfuse_enabled": langfuse_handler is not None
     })
     
     return result
@@ -1043,18 +1114,27 @@ def call_chart_agent(prompt: str, trace_id: str = None) -> ChartData:
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
     chart_agent = llm.with_structured_output(ChartData)
     
-    result = chart_agent.invoke(
-        messages,
-        config={
-            "callbacks": [langfuse_handler],
-            "run_name": "chart-generation",
-            "metadata": {"trace_id": trace_id}
-        }
-    )
+    # Build config with optional Langfuse callback
+    config = {
+        "run_name": "chart-generation",
+        "metadata": {"trace_id": trace_id}
+    }
+    if langfuse_handler:
+        config["callbacks"] = [langfuse_handler]
+    
+    result = chart_agent.invoke(messages, config=config)
+    
+    # Flush Langfuse to ensure traces are sent
+    if langfuse_handler:
+        try:
+            langfuse_handler.flush()
+        except Exception as e:
+            logger.warning(f"Langfuse flush failed: {e}")
     
     logger.info("Chart configuration generated", extra={
         "trace_id": trace_id, "chart_type": result.chart_type,
-        "title": result.title, "data_points": len(result.x_values)
+        "title": result.title, "data_points": len(result.x_values),
+        "langfuse_enabled": langfuse_handler is not None
     })
     
     return result
@@ -1579,7 +1659,35 @@ def health():
         "db": {
             "clickhouse": "iw_dev",
             "postgres": "chat_history"
+        },
+        "langfuse": {
+            "enabled": langfuse_handler is not None,
+            "host": os.getenv("LANGFUSE_HOST", "not set"),
+            "public_key_set": bool(os.getenv("LANGFUSE_PUBLIC_KEY")),
+            "secret_key_set": bool(os.getenv("LANGFUSE_SECRET_KEY"))
         }
+    }
+
+@app.get("/debug/langfuse")
+def debug_langfuse():
+    """Debug endpoint to check Langfuse configuration"""
+    public_key = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+    secret_key = os.getenv("LANGFUSE_SECRET_KEY", "")
+    host = os.getenv("LANGFUSE_HOST", "")
+    
+    return {
+        "langfuse_handler_initialized": langfuse_handler is not None,
+        "environment_variables": {
+            "LANGFUSE_HOST": host if host else "NOT SET",
+            "LANGFUSE_PUBLIC_KEY": f"{public_key[:20]}..." if public_key else "NOT SET",
+            "LANGFUSE_SECRET_KEY": f"{secret_key[:10]}..." if secret_key else "NOT SET"
+        },
+        "recommendations": [] if langfuse_handler else [
+            "Ensure LANGFUSE_SECRET_KEY is set in environment",
+            "Ensure LANGFUSE_PUBLIC_KEY is set in environment",
+            "Verify LANGFUSE_HOST is accessible from this container",
+            "Check that Langfuse server is running and healthy"
+        ]
     }
 
 # ============== STARTUP/SHUTDOWN ==============
@@ -1587,12 +1695,21 @@ def health():
 @app.on_event("startup")
 async def startup_event():
     """Initialize resources on startup"""
+    global langfuse_handler
+    
     init_connection_pools()
     init_conversation_tables()
+    
+    # Re-initialize Langfuse handler in case env vars are now available
+    if langfuse_handler is None:
+        logger.info("Re-attempting Langfuse initialization on startup...")
+        langfuse_handler = create_langfuse_handler()
+    
     logger.info("Application started successfully", extra={
         "event": "startup", 
         "features": ["connection_pooling", "conversation_summary_buffer_memory", "langfuse", "loki_logging"],
-        "memory_system": "ConversationSummaryBufferMemory (k=10) + PostgreSQL persistence"
+        "memory_system": "ConversationSummaryBufferMemory (k=10) + PostgreSQL persistence",
+        "langfuse_enabled": langfuse_handler is not None
     })
 
 @app.on_event("shutdown")
