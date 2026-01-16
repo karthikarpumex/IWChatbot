@@ -20,10 +20,10 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 # Disable OpenTelemetry auto-instrumentation
-os.environ["OTEL_SDK_DISABLED"] = "true"
+#os.environ["OTEL_SDK_DISABLED"] = "true"
 
 # Import langfuse AFTER langchain (langfuse requires langchain to be available)
-from langfuse.callback import CallbackHandler
+from langfuse.langchain import CallbackHandler
 import sqlglot
 from sqlglot import exp, parse_one, errors
 import uuid
@@ -40,7 +40,7 @@ try:
     LOKI_AVAILABLE = True
 except ImportError:
     LOKI_AVAILABLE = False
-    print("⚠️  logging_loki not available - Loki logging disabled")
+    # Will log warning after logger is setup
 
 load_dotenv()
 
@@ -49,6 +49,8 @@ load_dotenv()
 def setup_loki_logging():
     """Setup Loki logging for application logs"""
     handlers = [logging.StreamHandler()]
+    loki_enabled = False
+    loki_error = None
     
     if LOKI_AVAILABLE and os.getenv("ENABLE_LOKI_LOGGING", "true").lower() == "true":
         try:
@@ -59,11 +61,9 @@ def setup_loki_logging():
                 version="1",
             )
             handlers.append(loki_handler)
-            print("✅ Loki logging enabled")
+            loki_enabled = True
         except Exception as e:
-            print(f"⚠️  Loki logging disabled: {e}")
-    else:
-        print("ℹ️  Loki logging disabled (not available or not configured)")
+            loki_error = str(e)
     
     logging.basicConfig(
         level=logging.INFO,
@@ -71,7 +71,19 @@ def setup_loki_logging():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    return logging.getLogger("iwchatbot")
+    log = logging.getLogger("iwchatbot")
+    
+    # Log setup status after logger is configured
+    if not LOKI_AVAILABLE:
+        log.warning("logging_loki module not available - Loki logging disabled")
+    elif loki_enabled:
+        log.info("Loki logging enabled successfully")
+    elif loki_error:
+        log.warning(f"Loki logging disabled due to error: {loki_error}")
+    else:
+        log.info("Loki logging disabled (not configured)")
+    
+    return log
 
 logger = setup_loki_logging()
 
@@ -106,42 +118,16 @@ def init_connection_pools():
 
     logger.info("✅ Connection pools initialized")
 
+
 # ============== LANGFUSE SETUP ==============
 
-def create_langfuse_handler():
-    """Create Langfuse handler with explicit configuration from environment"""
-    try:
-        secret_key = os.getenv("LANGFUSE_SECRET_KEY")
-        public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
-        # Support both LANGFUSE_HOST and LANGFUSE_BASE_URL
-        host = os.getenv("LANGFUSE_BASE_URL") or os.getenv("LANGFUSE_HOST", "http://localhost:3001")
-        
-        if not secret_key or not public_key:
-            logger.warning("⚠️  Langfuse keys not found - tracing disabled")
-            logger.warning(f"   LANGFUSE_SECRET_KEY: {'set' if secret_key else 'NOT SET'}")
-            logger.warning(f"   LANGFUSE_PUBLIC_KEY: {'set' if public_key else 'NOT SET'}")
-            return None
-        
-        # Set environment variables for Langfuse SDK (it reads from env automatically)
-        os.environ["LANGFUSE_SECRET_KEY"] = secret_key
-        os.environ["LANGFUSE_PUBLIC_KEY"] = public_key
-        os.environ["LANGFUSE_HOST"] = host
-        
-        # Create handler - it reads credentials from environment variables
-        handler = CallbackHandler()
-        
-        logger.info(f"✅ Langfuse handler initialized")
-        logger.info(f"   Host: {host}")
-        logger.info(f"   Public Key: {public_key[:20]}...")
-        return handler
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize Langfuse: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return None
-
 # Initialize handler (will be None if config missing)
-langfuse_handler = create_langfuse_handler()
+try:
+    langfuse_handler = CallbackHandler()
+    logger.info("Langfuse callback handler initialized successfully")
+except Exception as e:
+    langfuse_handler = None
+    logger.warning(f"Failed to initialize Langfuse handler: {e}")
 # ============== MIDDLEWARE ==============
 
 @app.middleware("http")
@@ -209,44 +195,53 @@ def init_conversation_tables():
         cur = conn.cursor()
         
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS conversation_messages (
-                id SERIAL PRIMARY KEY,
-                session_id VARCHAR(255) NOT NULL,
-                message_type VARCHAR(10) NOT NULL,
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                session_id UUID PRIMARY KEY,
+                user_id VARCHAR(255) NOT NULL,
+                session_status VARCHAR(20) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_message_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create chat_messages table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                message_id SERIAL PRIMARY KEY,
+                session_id UUID NOT NULL REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
+                role VARCHAR(20) NOT NULL,
                 content TEXT NOT NULL,
                 sql_query TEXT,
                 filtered_sql TEXT,
                 chart_data JSONB,
                 result_data JSONB,
                 execution_time FLOAT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                error TEXT,
+                langfuse_trace_id VARCHAR(255),
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
-        # Add new columns if table already exists (migration)
-        for col_def in [
-            ("sql_query", "TEXT"),
-            ("filtered_sql", "TEXT"),
-            ("chart_data", "JSONB"),
-            ("result_data", "JSONB"),
-            ("execution_time", "FLOAT")
-        ]:
-            try:
-                cur.execute(f"ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS {col_def[0]} {col_def[1]}")
-            except Exception:
-                pass  # Column might already exist
+        # Create indexes for optimal performance
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_session_time 
+            ON chat_messages(session_id, created_at)
+        """)
         
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_conversation_session 
-            ON conversation_messages(session_id, timestamp)
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_langfuse_trace 
+            ON chat_messages(langfuse_trace_id)
         """)
         
         conn.commit()
         cur.close()
-        logger.info("Conversation tables initialized with chart persistence")
+        logger.info("Conversation tables initialized with token tracking")
         
     except Exception as e:
-        logger.error(f"Failed to initialize conversation tables: {e}")
+        logger.error(f"Failed to initialize chat tables: {e}")
     finally:
         release_postgres_conn(conn)
 
@@ -254,33 +249,60 @@ def save_to_permanent_storage(
     session_id: str, 
     message_type: str, 
     content: str,
+    user_id: str,
+    session_status: str,
     sql_query: str = None,
     filtered_sql: str = None,
     chart_data: dict = None,
     result_data: list = None,
-    execution_time: float = None
+    execution_time: float = None,
+    error: str = None,
+    langfuse_trace_id: str = None,
+    input_tokens: int = None,
+    output_tokens: int = None
 ):
-    """Save message to PostgreSQL for permanent audit trail with rich metadata"""
+    """Save message to PostgreSQL for permanent audit trail with rich metadata and token usage"""
     try:
         conn = get_postgres_conn()
         cur = conn.cursor()
         
-        # Convert dicts/lists to JSON strings
+        # Ensure session exists
+        cur.execute("""
+            INSERT INTO chat_sessions (session_id, user_id, last_message_at,session_status) 
+            VALUES (%s, %s, CURRENT_TIMESTAMP, %s)
+            ON CONFLICT (session_id) DO UPDATE SET 
+                last_message_at = CURRENT_TIMESTAMP,
+                session_status = %s
+        """, (session_id, user_id, session_status, session_status))
+        
+        # Convert role from old format to new format
+        role = 'user' if message_type == 'human' else 'assistant' if message_type == 'ai' else message_type
+        
+        # Convert chart data to JSON string if provided
         chart_json = json.dumps(chart_data) if chart_data else None
-        result_json = json.dumps(result_data[:100]) if result_data else None  # Limit to first 100 rows
+        result_json = json.dumps(result_data) if result_data else None
         
         cur.execute("""
-            INSERT INTO conversation_messages 
-            (session_id, message_type, content, sql_query, filtered_sql, chart_data, result_data, execution_time) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """, (session_id, message_type, content, sql_query, filtered_sql, chart_json, result_json, execution_time))
+            INSERT INTO chat_messages 
+            (session_id, role, content, sql_query, filtered_sql, chart_data, result_data,
+             execution_time, error, langfuse_trace_id, input_tokens, output_tokens) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (session_id, role, content, sql_query, filtered_sql, chart_json, result_json,
+              execution_time, error, langfuse_trace_id, input_tokens, output_tokens))
         
         conn.commit()
         cur.close()
-        logger.debug(f"Saved {message_type} message with chart_data={chart_data is not None} to permanent storage for session {session_id}")
+        logger.debug(f"Saved {role} message with tokens=({input_tokens},{output_tokens}) trace={langfuse_trace_id} for session {session_id}")
         
     except Exception as e:
-        logger.warning(f"Failed to save message to permanent storage: {e}")
+        logger.error(f"Error in save_to_permanent_storage for session {session_id}: {e}", extra={
+            "session_id": session_id,
+            "message_type": message_type,
+            "langfuse_trace_id": langfuse_trace_id,
+            "error": str(e),
+            "method": "save_to_permanent_storage"
+        })
+        raise  # Re-raise to bubble up
     finally:
         if 'conn' in locals():
             release_postgres_conn(conn)
@@ -293,10 +315,11 @@ def load_from_permanent_storage(session_id: str) -> list[BaseMessage]:
         
         # Load content plus SQL/data for context reconstruction
         cur.execute("""
-            SELECT message_type, content, sql_query, result_data, timestamp 
-            FROM conversation_messages 
-            WHERE session_id = %s 
-            ORDER BY timestamp ASC
+            SELECT cm.role, cm.content, cm.sql_query, cm.result_data
+            FROM chat_messages cm
+            JOIN chat_sessions cs ON cm.session_id = cs.session_id
+            WHERE cm.session_id = %s 
+            ORDER BY cm.created_at ASC
         """, (session_id,))
         
         db_messages = cur.fetchall()
@@ -304,10 +327,11 @@ def load_from_permanent_storage(session_id: str) -> list[BaseMessage]:
         
         messages = []
         for row in db_messages:
-            message_type, content, sql_query, result_data, timestamp = row
-            if message_type == 'human':
+            role, content, sql_query, result_data = row
+            
+            if role == 'user':
                 messages.append(HumanMessage(content=content))
-            elif message_type == 'ai':
+            elif role == 'assistant':
                 # Reconstruct rich context for AI messages
                 rich_content = content
                 if sql_query:
@@ -320,7 +344,7 @@ def load_from_permanent_storage(session_id: str) -> list[BaseMessage]:
                     elif data:
                         rich_content += f"\n[Data sample (first 3 of {len(data)}): {data[:3]}]"
                 messages.append(AIMessage(content=rich_content))
-            elif message_type == 'system':
+            elif role == 'system':
                 messages.append(SystemMessage(content=content))
         
         logger.info(f"Loaded {len(messages)} messages from DB for session {session_id}")
@@ -328,7 +352,7 @@ def load_from_permanent_storage(session_id: str) -> list[BaseMessage]:
         
     except Exception as e:
         logger.warning(f"Failed to load session from DB: {e}")
-        return []
+        raise
     finally:
         if 'conn' in locals():
             release_postgres_conn(conn)
@@ -527,8 +551,8 @@ DATE AND YEAR HANDLING:
 
 CRITICAL RULES - READ FIRST:
 ============================
-1. **ONLY USE TABLES LISTED BELOW** - These are the ONLY 8 tables that exist. Do NOT invent or assume any other tables.
-2. If asked about data not available in the schema (e.g., employers, companies, contractors, jobs, projects), set cannot_answer=true and provide a helpful refusal_message.
+1. **ONLY USE TABLES LISTED BELOW** - These are the ONLY 9 tables that exist. Do NOT invent or assume any other tables.
+2. If asked about data not available in the schema (e.g., projects), set cannot_answer=true and provide a helpful refusal_message.
 3. For ANY questions about people, members, individuals, or person information → use iw_dev.iw_contact08
 4. NEVER generate SQL for tables not explicitly listed in the schema below.
 
@@ -690,6 +714,17 @@ Columns:
 - passed (String): Whether passed
 - year (String): Year of registration
 
+TABLE: iw_dev.employmenthistory (Employement and contract history)
+Columns:
+- active_latest_userid (String): Links to iw_contact08.userid
+- userid (String):  userid
+- month (String): Month of employment
+- year (String): Year of employment
+- hours (Decimal): Hours worked
+- companyname (String): Company name or contractor name or employer name
+- localunion (String): Local union identifier
+
+
 BUSINESS LOGIC HELPERS:
 ======================
 DUES STATUS:
@@ -714,7 +749,7 @@ SQL GENERATION RULES:
 ====================
 1. **CRITICAL**: Always prefix table names with database: iw_dev.table_name (e.g., iw_dev.iw_contact08)
 2. **CRITICAL**: ONLY use columns explicitly listed in the schema above - NEVER assume columns exist
-3. **CRITICAL**: ONLY use the 8 tables listed above. NO OTHER TABLES EXIST (no employers, companies, contractors, jobs, projects, etc.)
+3. **CRITICAL**: ONLY use the 9 tables listed above. NO OTHER TABLES EXIST (no  projects, etc.)
 4. **CRITICAL**: Always use iw_contact08 as the primary table when member/people info is needed
 5. String columns require single quotes: localunionid = '782' NOT localunionid = 782
 6. For DateTime64 columns (paidthru, createddate, lastupdateddate), use toDate() for date comparisons
@@ -769,8 +804,8 @@ Return a JSON object with:
 - year: Year filter if applicable (for date validation)
 - can_chart: Boolean indicating if results are suitable for charting
 - chart_context: Create a brief context for charting based on the user prompt
-- cannot_answer: Boolean - set to TRUE if the question asks about data NOT in the schema (e.g., employers, companies, contractors, jobs, projects)
-- refusal_message: If cannot_answer is true, provide a helpful message like "I cannot answer this question as employer/company data is not available in the database. I can help with member information, certifications, drug tests, and training records."
+- cannot_answer: Boolean - set to TRUE if the question asks about data NOT in the schema (e.g., projects, wages, payments)
+- refusal_message: If cannot_answer is true, provide a helpful message explaining what data is not available. Available data includes: member information, certifications, drug tests, training records, and employment/contractor history."
 """
 
 CHART_SYSTEM_PROMPT = """You are a data analyst that creates chart configurations and summaries from query results.
@@ -882,6 +917,7 @@ TABLE_DATES = {
     "member_certifications": (1900, 2241),
     "member_online_registration_courses": (2012, _CURRENT_YEAR),
     "trainingprogramcertificates": (2006, _CURRENT_YEAR),
+    "employmenthistory": (1900, _CURRENT_YEAR),
 }
 
 SENSITIVE_COLUMNS = {"ssn", "sin", "ssn__c", "phone1", "phone4", "phone_4", "emergencynumber", "address1", "address2", "postalcode"}
@@ -897,6 +933,7 @@ LOCAL_TABLE_FIELDS = {
     "iw_contact08": "localunionid",
     "memberunionhistory1": "localunionid",
     "drugtestrecords": "local_union_number__c",
+    "employmenthistory": "localunion",
 }
 
 MEMBER_TABLE_FIELDS = {
@@ -908,6 +945,7 @@ MEMBER_TABLE_FIELDS = {
     "member_certifications": "active_latest_userid",
     "member_online_registration_courses": "active_latest_userid",
     "trainingprogramcertificates": "active_latest_userid",
+    "employmenthistory": "active_latest_userid",
 }
 
 # ============== SQL FILTERING FUNCTIONS ==============
@@ -1065,11 +1103,16 @@ class State(TypedDict):
     chart: ChartData | None
     denied_columns: set[str]
     chart_context: str | None
+    # Token tracking
+    total_input_tokens: int
+    total_output_tokens: int
 
 # ============== LLM AGENTS (UPDATED WITH MEMORY) ==============
 
-def call_sql_agent(prompt: str, trace_id: str = None, conversation_messages: list[BaseMessage] = None) -> SQLQuery:
-    """Generate SQL with Langfuse logging and optional conversation context"""
+def call_sql_agent(prompt: str, trace_id: str = None, conversation_messages: list[BaseMessage] = None) -> tuple[SQLQuery, dict]:
+    """Generate SQL with Langfuse logging and optional conversation context.
+    Returns tuple of (SQLQuery, token_usage_dict)
+    """
     
     if conversation_messages:
         messages = conversation_messages
@@ -1080,39 +1123,48 @@ def call_sql_agent(prompt: str, trace_id: str = None, conversation_messages: lis
         ]
 
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    sql_agent = llm.with_structured_output(SQLQuery)
     
     # Build config with optional Langfuse callback
     config = {"run_name": "sql-generation"}
     if langfuse_handler:
         config["callbacks"] = [langfuse_handler]
     
-    result = sql_agent.invoke(messages, config=config)
+    # Use include_raw=True to get both structured output AND raw response with token usage
+    sql_agent = llm.with_structured_output(SQLQuery, include_raw=True)
+    response = sql_agent.invoke(messages, config=config)
     
-    # Flush Langfuse to ensure traces are sent
-    if langfuse_handler:
-        try:
-            langfuse_handler.flush()
-        except Exception as e:
-            logger.warning(f"Langfuse flush failed: {e}")
+    # Extract structured result and token usage
+    result = response['parsed']
+    raw_response = response['raw']
+    
+    # Extract token usage from raw response metadata
+    token_usage = {'input_tokens': 0, 'output_tokens': 0}
+    if hasattr(raw_response, 'response_metadata') and raw_response.response_metadata:
+        usage = raw_response.response_metadata.get('token_usage', {})
+        token_usage = {
+            'input_tokens': usage.get('prompt_tokens', 0),
+            'output_tokens': usage.get('completion_tokens', 0)
+        }
     
     logger.info("SQL query generated", extra={
         "trace_id": trace_id, "sql_preview": result.sql[:100] if result.sql else "empty",
         "tables": result.tables, "can_chart": result.can_chart,
         "has_conversation_context": bool(conversation_messages),
-        "langfuse_enabled": langfuse_handler is not None
+        "langfuse_enabled": langfuse_handler is not None,
+        "tokens": token_usage
     })
     
-    return result
+    return result, token_usage
 
-def call_chart_agent(prompt: str, trace_id: str = None) -> ChartData:
-    """Generate chart with Langfuse logging"""
+def call_chart_agent(prompt: str, trace_id: str = None) -> tuple[ChartData, dict]:
+    """Generate chart with Langfuse logging.
+    Returns tuple of (ChartData, token_usage_dict)
+    """
     messages = [
         SystemMessage(content=CHART_SYSTEM_PROMPT),
         HumanMessage(content=prompt)
     ]
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    chart_agent = llm.with_structured_output(ChartData)
     
     # Build config with optional Langfuse callback
     config = {
@@ -1122,22 +1174,31 @@ def call_chart_agent(prompt: str, trace_id: str = None) -> ChartData:
     if langfuse_handler:
         config["callbacks"] = [langfuse_handler]
     
-    result = chart_agent.invoke(messages, config=config)
+    # Use include_raw=True to get both structured output AND raw response with token usage
+    chart_agent = llm.with_structured_output(ChartData, include_raw=True)
+    response = chart_agent.invoke(messages, config=config)
     
-    # Flush Langfuse to ensure traces are sent
-    if langfuse_handler:
-        try:
-            langfuse_handler.flush()
-        except Exception as e:
-            logger.warning(f"Langfuse flush failed: {e}")
+    # Extract structured result and token usage
+    result = response['parsed']
+    raw_response = response['raw']
     
+    # Extract token usage from raw response metadata
+    token_usage = {'input_tokens': 0, 'output_tokens': 0}
+    if hasattr(raw_response, 'response_metadata') and raw_response.response_metadata:
+        usage = raw_response.response_metadata.get('token_usage', {})
+        token_usage = {
+            'input_tokens': usage.get('prompt_tokens', 0),
+            'output_tokens': usage.get('completion_tokens', 0)
+        }
+
     logger.info("Chart configuration generated", extra={
         "trace_id": trace_id, "chart_type": result.chart_type,
         "title": result.title, "data_points": len(result.x_values),
-        "langfuse_enabled": langfuse_handler is not None
+        "langfuse_enabled": langfuse_handler is not None,
+        "tokens": token_usage
     })
     
-    return result
+    return result, token_usage
 
 # ============== HELPER FUNCTIONS ==============
 
@@ -1166,83 +1227,110 @@ def create_sql_prompt_with_history(question: str, messages: list[BaseMessage]) -
 @log_node("generate_sql")
 def generate_sql(state: State) -> State:
     """Generate SQL using ConversationSummaryBufferMemory for smart context management"""
-    base_question = state['question']
-    session_id = state['session_id']
-    
-    # Get conversation memory (with automatic summarization!)
-    conv_memory = get_conversation_memory(session_id, k=10)
-    
-    # Get messages from memory (already includes summary if exists)
-    conversation_messages = conv_memory.messages
-    
-    if conversation_messages:
-        logger.info(f"Using ConversationSummaryBufferMemory for session {session_id} ({len(conversation_messages)} messages)")
+    try:
+        base_question = state['question']
+        session_id = state['session_id']
         
-        # Check if first message is a summary
-        has_summary = isinstance(conversation_messages[0], SystemMessage) if conversation_messages else False
-        if has_summary:
-            logger.info(f">> Memory includes summary + {len(conversation_messages)-1} recent messages")
+        # Initialize token tracking
+        state['total_input_tokens'] = 0
+        state['total_output_tokens'] = 0
         
-        # Create SQL prompt with memory context
-        sql_prompt_messages = create_sql_prompt_with_history(base_question, conversation_messages)
+        # Get conversation memory (with automatic summarization!)
+        conv_memory = get_conversation_memory(session_id, k=10)
         
-        # Generate SQL with context
-        state['sql_query'] = call_sql_agent(
-            prompt=f"USER QUESTION: {base_question}\n\nGenerate SQL with conversation context.",
-            trace_id=state.get('trace_id'),
-            conversation_messages=sql_prompt_messages
-        )
+        # Get messages from memory (already includes summary if exists)
+        conversation_messages = conv_memory.messages
         
-        # Handle refusal case - question cannot be answered with available data
-        if state['sql_query'] and state['sql_query'].cannot_answer:
-            refusal_msg = state['sql_query'].refusal_message or "I cannot answer this question as that data is not available in the database."
-            state['error'] = refusal_msg
-            state['sql_query'] = None
-            logger.info(f"Query refused: {refusal_msg}", extra={"trace_id": state.get('trace_id')})
-            return state
+        if conversation_messages:
+            logger.info(f"Using ConversationSummaryBufferMemory for session {session_id} ({len(conversation_messages)} messages)")
+            
+            # Check if first message is a summary
+            has_summary = isinstance(conversation_messages[0], SystemMessage) if conversation_messages else False
+            if has_summary:
+                logger.info(f">> Memory includes summary + {len(conversation_messages)-1} recent messages")
+            
+            # Create SQL prompt with memory context
+            sql_prompt_messages = create_sql_prompt_with_history(base_question, conversation_messages)
+            
+            # Generate SQL with context - now returns tuple (result, token_usage)
+            sql_result, sql_tokens = call_sql_agent(
+                prompt=f"USER QUESTION: {base_question}\\n\\nGenerate SQL with conversation context.",
+                trace_id=state.get('trace_id'),
+                conversation_messages=sql_prompt_messages
+            )
+            state['sql_query'] = sql_result
+            
+            # Accumulate tokens
+            state['total_input_tokens'] += sql_tokens.get('input_tokens', 0)
+            state['total_output_tokens'] += sql_tokens.get('output_tokens', 0)
+            
+            # Handle refusal case - question cannot be answered with available data
+            if state['sql_query'] and state['sql_query'].cannot_answer:
+                refusal_msg = state['sql_query'].refusal_message or "I cannot answer this question as that data is not available in the database."
+                state['error'] = refusal_msg
+                state['sql_query'] = None
+                logger.info(f"Query refused: {refusal_msg}", extra={"trace_id": state.get('trace_id')})
+                return state
+            
+            # Set chart context from the SQL query result
+            if state['sql_query'] and state['sql_query'].chart_context:
+                state['chart_context'] = state['sql_query'].chart_context
+            else:
+                # Generate basic chart context from the question
+                state['chart_context'] = f"Chart visualization for: {base_question}"
         
-        # Set chart context from the SQL query result
-        if state['sql_query'] and state['sql_query'].chart_context:
-            state['chart_context'] = state['sql_query'].chart_context
+            logger.info("SQL generation with conversation context", extra={
+                "trace_id": state.get('trace_id'), 
+                "conversation_messages": len(conversation_messages),
+                "has_summary": has_summary,
+                "session_id": session_id,
+                "sql_tokens": sql_tokens
+            })
         else:
-            # Generate basic chart context from the question
-            state['chart_context'] = f"Chart visualization for: {base_question}"
-        
-        logger.info("SQL generation with conversation context", extra={
-            "trace_id": state.get('trace_id'), 
-            "conversation_messages": len(conversation_messages),
-            "has_summary": has_summary,
-            "session_id": session_id
-        })
-    else:
-        # No history - first message
-        state['sql_query'] = call_sql_agent(
-            f"""USER QUESTION: {base_question}
+            # No history - first message - now returns tuple (result, token_usage)
+            sql_result, sql_tokens = call_sql_agent(
+                f"""USER QUESTION: {base_question}
 
-Generate the SQL query based on the schema and rules provided.""",
-            state.get('trace_id')
-        )
+    Generate the SQL query based on the schema and rules provided.""",
+                state.get('trace_id')
+            )
+            state['sql_query'] = sql_result
+            
+            # Accumulate tokens
+            state['total_input_tokens'] += sql_tokens.get('input_tokens', 0)
+            state['total_output_tokens'] += sql_tokens.get('output_tokens', 0)
+            
+            # Handle refusal case - question cannot be answered with available data
+            if state['sql_query'] and state['sql_query'].cannot_answer:
+                refusal_msg = state['sql_query'].refusal_message or "I cannot answer this question as that data is not available in the database."
+                state['error'] = refusal_msg
+                state['sql_query'] = None
+                logger.info(f"Query refused: {refusal_msg}", extra={"trace_id": state.get('trace_id')})
+                return state
+            
+            # Set chart context from the SQL query result
+            if state['sql_query'] and state['sql_query'].chart_context:
+                state['chart_context'] = state['sql_query'].chart_context
+            else:
+                # Generate basic chart context from the question
+                state['chart_context'] = f"Chart visualization for: {base_question}"
+            
+            logger.info("SQL generation without conversation context (first message)", extra={
+                "trace_id": state.get('trace_id'), "session_id": session_id,
+                "sql_tokens": sql_tokens
+            })
         
-        # Handle refusal case - question cannot be answered with available data
-        if state['sql_query'] and state['sql_query'].cannot_answer:
-            refusal_msg = state['sql_query'].refusal_message or "I cannot answer this question as that data is not available in the database."
-            state['error'] = refusal_msg
-            state['sql_query'] = None
-            logger.info(f"Query refused: {refusal_msg}", extra={"trace_id": state.get('trace_id')})
-            return state
-        
-        # Set chart context from the SQL query result
-        if state['sql_query'] and state['sql_query'].chart_context:
-            state['chart_context'] = state['sql_query'].chart_context
-        else:
-            # Generate basic chart context from the question
-            state['chart_context'] = f"Chart visualization for: {base_question}"
-        
-        logger.info("SQL generation without conversation context (first message)", extra={
-            "trace_id": state.get('trace_id'), "session_id": session_id
-        })
+        return state
     
-    return state
+    except Exception as e:
+        logger.error(f"Error in generate_sql for session {state.get('session_id')}: {e}", extra={
+            "session_id": state.get('session_id'),
+            "trace_id": state.get('trace_id'),
+            "question_preview": state.get('question', '')[:100],
+            "error": str(e),
+            "method": "generate_sql"
+        })
+        raise  # Re-raise to bubble up to main method
 
 @log_node("apply_rbac_filter")
 def apply_rbac_filter(state: State) -> State:
@@ -1262,7 +1350,14 @@ def apply_rbac_filter(state: State) -> State:
             'tables': state['sql_query'].tables
         }
     except Exception as e:
-        state['error'] = f"Filter application failed: {str(e)}"
+        logger.error(f"Error in apply_rbac_filter for session {state.get('session_id')}: {e}", extra={
+            "session_id": state.get('session_id'),
+            "trace_id": state.get('trace_id'),
+            "user_role": state.get('user_role', {}).get('role') if state.get('user_role') else None,
+            "error": str(e),
+            "method": "apply_rbac_filter"
+        })
+        raise  # Re-raise to bubble up to main method
     
     return state
 
@@ -1279,8 +1374,14 @@ def validate_filter(state: State) -> State:
         logger.info(state['filtered_sql'], extra={"trace_id": state.get('trace_id')})
         state['validation_result'] = {'valid': True, 'issues': []}
     except ValueError as e:
-        state['error'] = f"Validation failed: {str(e)}"
-        state['validation_result'] = {'valid': False, 'issues': [str(e)]}
+        logger.error(f"Error in validate_filter for session {state.get('session_id')}: {e}", extra={
+            "session_id": state.get('session_id'),
+            "trace_id": state.get('trace_id'),
+            "sql_query": state.get('sql_query', {}).get('sql', '')[:100] if state.get('sql_query') else None,
+            "error": str(e),
+            "method": "validate_filter"
+        })
+        raise  # Re-raise to bubble up to main method
     
     return state
 
@@ -1289,22 +1390,34 @@ def validate_dates(state: State) -> State:
     if state['error']:
         return state
     
-    query = state['sql_query']
-    if query and query.year:
-        for table in query.tables:
-            if table in TABLE_DATES:
-                try:
-                    min_yr, max_yr = TABLE_DATES[table]
-                    year_int = int(query.year)
-                    if not (min_yr <= year_int <= max_yr):
-                        state['date_valid'] = False
-                        state['error'] = f"{table} only has {min_yr}-{max_yr} data"
-                        return state
-                except (ValueError, TypeError):
-                    pass
+    try:
+        query = state['sql_query']
+        if query and query.year:
+            for table in query.tables:
+                if table in TABLE_DATES:
+                    try:
+                        min_yr, max_yr = TABLE_DATES[table]
+                        year_int = int(query.year)
+                        if not (min_yr <= year_int <= max_yr):
+                            state['date_valid'] = False
+                            state['error'] = f"{table} only has {min_yr}-{max_yr} data"
+                            return state
+                    except (ValueError, TypeError):
+                        pass
+        
+        state['date_valid'] = True
+        return state
     
-    state['date_valid'] = True
-    return state
+    except Exception as e:
+        logger.error(f"Error in validate_dates for session {state.get('session_id')}: {e}", extra={
+            "session_id": state.get('session_id'),
+            "trace_id": state.get('trace_id'),
+            "query_year": state.get('sql_query', {}).get('year') if state.get('sql_query') else None,
+            "tables": state.get('sql_query', {}).get('tables', []) if state.get('sql_query') else [],
+            "error": str(e),
+            "method": "validate_dates"
+        })
+        raise  # Re-raise to bubble up to main method
 
 @log_node("run_query")
 def run_query(state: State) -> State:
@@ -1322,7 +1435,14 @@ def run_query(state: State) -> State:
         })
         logger.info(state['data'], extra={"trace_id": state.get('trace_id')})
     except Exception as e:
-        state['error'] = f"Query failed: {str(e)}"
+        logger.error(f"Error in run_query for session {state.get('session_id')}: {e}", extra={
+            "session_id": state.get('session_id'),
+            "trace_id": state.get('trace_id'),
+            "filtered_sql": state.get('filtered_sql', '')[:100] if state.get('filtered_sql') else None,
+            "error": str(e),
+            "method": "run_query"
+        })
+        raise  # Re-raise to bubble up to main method
     
     return state
 
@@ -1346,9 +1466,28 @@ DATA INFO:
 Analyze this data and provide the chart configuration and summary."""
     
     try:
-        state['chart'] = call_chart_agent(user_prompt, state.get('trace_id'))
+        # Now returns tuple (result, token_usage)
+        chart_result, chart_tokens = call_chart_agent(user_prompt, state.get('trace_id'))
+        state['chart'] = chart_result
+        
+        # Accumulate tokens from chart generation
+        state['total_input_tokens'] += chart_tokens.get('input_tokens', 0)
+        state['total_output_tokens'] += chart_tokens.get('output_tokens', 0)
+        
+        logger.info("Chart created with token tracking", extra={
+            "trace_id": state.get('trace_id'),
+            "chart_tokens": chart_tokens,
+        })
     except Exception as e:
-        state['error'] = f"Analysis failed: {str(e)}"
+        logger.error(f"Error in create_chart for session {state.get('session_id')}: {e}", extra={
+            "session_id": state.get('session_id'),
+            "trace_id": state.get('trace_id'),
+            "data_count": len(state.get('data', [])),
+            "chart_context": state.get('chart_context', '')[:100],
+            "error": str(e),
+            "method": "create_chart"
+        })
+        raise  # Re-raise to bubble up to main method
     
     return state
 
@@ -1390,86 +1529,81 @@ class Query(BaseModel):
 # ============== MAIN WORKFLOW (UPDATED WITH MEMORY) ==============
 
 def run_chatbot_query(question: str, user_role: UserRole, session_id: str, trace_id: str) -> dict:
-    """Execute workflow with ConversationSummaryBufferMemory"""
+    """Execute workflow with ConversationSummaryBufferMemory and token tracking"""
     
-    denied_columns = set() if user_role.role == "admin" else SENSITIVE_COLUMNS
-    
-    # Get conversation memory (this will load from database if session not in active memory)
-    conv_memory = get_conversation_memory(session_id, k=10)
-    
-    # Log the loaded conversation context (safely check for summary)
-    has_summary = len(conv_memory.messages) > 0 and isinstance(conv_memory.messages[0], SystemMessage)
-    logger.info(f"Loaded conversation memory for session {session_id}: {len(conv_memory.messages)} messages", extra={
-        "session_id": session_id,
-        "trace_id": trace_id,
-        "loaded_messages": len(conv_memory.messages),
-        "has_summary": has_summary
-    })
-    
-    # Execute workflow (SQL generation will use existing conversation history)
-    result = graph.invoke({
-        "question": question,
-        "user_role": user_role,
-        "session_id": session_id,
-        "trace_id": trace_id,
-        "sql_query": None,
-        "filtered_sql": None,
-        "filter_metadata": None,
-        "validation_result": None,
-        "date_valid": True,
-        "error": None,
-        "data": [],
-        "chart": None,
-        "denied_columns": denied_columns,
-        "chart_context": None
-    })
-    
-    # Save user question to permanent storage (simple - just text)
-    save_to_permanent_storage(session_id, "human", question)
-    
-    # Add to memory for context management
-    conv_memory._add_message_to_memory_only(HumanMessage(content=question))
-    
-    # Save assistant response with FULL rich metadata (chart, SQL, data)
-    if result.get('chart') and result['chart'].summary:
-        chart_data = result['chart'].model_dump() if result['chart'] else None
+    try:
+        denied_columns = set() if user_role.role == "admin" else SENSITIVE_COLUMNS
         
-        # Save to permanent storage with all rich data
-        save_to_permanent_storage(
-            session_id=session_id,
-            message_type="ai",
-            content=result['chart'].summary,
-            sql_query=result['sql_query'].sql if result.get('sql_query') else None,
-            filtered_sql=result.get('filtered_sql'),
-            chart_data=chart_data,
-            result_data=result.get('data'),
-            execution_time=None  # Will be set by caller if needed
-        )
+        # Get conversation memory (this will load from database if session not in active memory)
+        conv_memory = get_conversation_memory(session_id, k=10)
         
-        # Add RICH context to memory so LLM knows what data was returned
-        # Include SQL query and key data points for proper conversation context
-        memory_content = result['chart'].summary
-        if result.get('sql_query') and result['sql_query'].sql:
-            memory_content += f"\n\n[SQL executed: {result['sql_query'].sql}]"
-        if result.get('data') and len(result['data']) <= 10:
-            # Include actual data for small result sets so LLM has context
-            memory_content += f"\n[Data returned: {result['data']}]"
-        elif result.get('data'):
-            # For larger results, include first few rows
-            memory_content += f"\n[Data sample (first 3 of {len(result['data'])}): {result['data'][:3]}]"
+        # Log the loaded conversation context (safely check for summary)
+        has_summary = len(conv_memory.messages) > 0 and isinstance(conv_memory.messages[0], SystemMessage)
+        logger.info(f"Loaded conversation memory for session {session_id}: {len(conv_memory.messages)} messages", extra={
+            "session_id": session_id,
+            "trace_id": trace_id,
+            "loaded_messages": len(conv_memory.messages),
+            "has_summary": has_summary
+        })
         
-        conv_memory._add_message_to_memory_only(AIMessage(content=memory_content))
+        # Add user question to memory BEFORE workflow (for context during SQL generation)
+        conv_memory._add_message_to_memory_only(HumanMessage(content=question))
         
-    elif result.get('error'):
-        # Save error response
-        save_to_permanent_storage(
-            session_id=session_id,
-            message_type="ai",
-            content=f"Error: {result['error']}"
-        )
-        conv_memory._add_message_to_memory_only(AIMessage(content=f"Error: {result['error']}"))
-    
-    return result
+        # Execute workflow (SQL generation will use existing conversation history)
+        result = graph.invoke({
+            "question": question,
+            "user_role": user_role,
+            "session_id": session_id,
+            "trace_id": trace_id,
+            "sql_query": None,
+            "filtered_sql": None,
+            "filter_metadata": None,
+            "validation_result": None,
+            "date_valid": True,
+            "error": None,
+            "data": [],
+            "chart": None,
+            "denied_columns": denied_columns,
+            "chart_context": None,
+            # Initialize token tracking
+            "total_input_tokens": 0,
+            "total_output_tokens": 0
+        })
+        
+        # Note: User question is already saved to permanent storage in /query endpoint
+        
+        # Save assistant response with FULL rich metadata (chart, SQL, data, tokens) -- now handled in process() for correct execution_time
+        if result.get('chart') and result['chart'].summary:
+            # Add RICH context to memory so LLM knows what data was returned
+            # Include SQL query and key data points for proper conversation context
+            memory_content = result['chart'].summary
+            if result.get('sql_query') and result['sql_query'].sql:
+                memory_content += f"\n\n[SQL executed: {result['sql_query'].sql}]"
+            if result.get('data') and len(result['data']) <= 10:
+                # Include actual data for small result sets so LLM has context
+                memory_content += f"\n[Data returned: {result['data']}]"
+            elif result.get('data'):
+                # For larger results, include first few rows
+                memory_content += f"\n[Data sample (first 3 of {len(result['data'])}): {result['data'][:3]}]"
+            conv_memory._add_message_to_memory_only(AIMessage(content=memory_content))
+            logger.info(f"Prepared AI response with tokens: input={result.get('total_input_tokens', 0)}, output={result.get('total_output_tokens', 0)}", extra={
+                "trace_id": trace_id,
+                "session_id": session_id
+            })
+        elif result.get('error'):
+            conv_memory._add_message_to_memory_only(AIMessage(content=f"Error: {result['error']}"))
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error in run_chatbot_query for session {session_id}: {e}", extra={
+            "session_id": session_id,
+            "trace_id": trace_id,
+            "question_preview": question[:100] if question else "empty",
+            "error": str(e),
+            "method": "run_chatbot_query"
+        })
+        raise  # Re-raise to bubble up to endpoint
 
 @app.post("/query")
 def process(q: Query, request: Request):
@@ -1488,92 +1622,232 @@ def process(q: Query, request: Request):
     else:
         session_id = str(uuid.uuid4())
     
+    logger.info(f"Processing query for session {session_id}", extra={
+        "trace_id": trace_id,
+        "session_id": session_id,
+        "question_preview": q.question[:100] if q.question else "empty"
+    })
+    
+    # Save user question to permanent storage IMMEDIATELY so session appears right away
+    # This ensures the session is visible even if user refreshes before workflow completes
+    save_to_permanent_storage(session_id, "human", q.question, user_id=user_role.user_id,session_status='In Progress')
+    
     try:
         result = run_chatbot_query(q.question, user_role, session_id, trace_id)
         duration = (datetime.now() - start_time).total_seconds()
-        
-        if result['error']:
-            return {"error": result['error'], "session_id": session_id}
-        
+
         chart_data = result['chart'].model_dump() if result['chart'] else None
-        summary = chart_data.get('summary') if chart_data else "Query completed"
-        
+
+        if result['error']:
+            summary = result['error']
+        else:
+             summary = chart_data.get('summary') if chart_data else "Query successfully completed"
+
+
+        # Save the AI response with execution_time to permanent storage
+        save_to_permanent_storage(
+            session_id=session_id,
+            message_type="assistant",
+            content=summary,
+            user_id=user_role.user_id,
+            sql_query=result['sql_query'].sql if result.get('sql_query') else None,
+            filtered_sql=result.get('filtered_sql'),
+            chart_data=chart_data,
+            result_data=result.get('data'),
+            execution_time=duration,
+            langfuse_trace_id=trace_id,
+            input_tokens=result.get('total_input_tokens', 0),
+            output_tokens=result.get('total_output_tokens', 0),
+            session_status='Completed'
+        )
+
         response_data = {
-            "session_id": session_id,
-            "trace_id": trace_id,
-            "original_sql": result['sql_query'].sql if result['sql_query'] else None,
-            "filtered_sql": result['filtered_sql'],
-            "summary": summary,
-            "chart": chart_data,
-            "data": result['data'],
-            "execution_time": f"{duration:.2f}s"
+            "is_success": True,
+            "message": "success",
+            "data": {
+                "session_id": session_id,
+                "trace_id": trace_id,
+                "session_status": "Completed",
+                "type": "assistant",
+                "sql_query": result['sql_query'].sql if result['sql_query'] else None,
+                "filtered_sql": result['filtered_sql'],
+                "content": summary,
+                "chart_data": chart_data,
+                "data": result['data'],
+                "execution_time": f"{duration:.2f}s",
+                "input_tokens": result.get('total_input_tokens', 0),
+                "output_tokens": result.get('total_output_tokens', 0)
+            }
         }
-        
+
+        logger.info(f"Query processed successfully for session {session_id} in {duration:.2f}s", extra={
+            "trace_id": trace_id,
+            "session_id": session_id,
+            "execution_time": duration
+        })
         return sanitize_json_data(response_data)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        duration = (datetime.now() - start_time).total_seconds()
+        error_message = str(e)
+        
+        # Save error information to database
+        try:
+            save_to_permanent_storage(
+                session_id=session_id,
+                message_type="assistant",
+                content=f"Error: {error_message}",
+                user_id=user_role.user_id,
+                session_status='Error',
+                execution_time=duration,
+                error=error_message,
+                langfuse_trace_id=trace_id
+            )
+        except Exception as db_error:
+            # If database save fails, log it but don't prevent the error response
+            logger.error(f"Failed to save error to database for session {session_id}: {db_error}")
+        
+        logger.error(f"Query processing failed for session {session_id}: {e}", extra={
+            "trace_id": trace_id,
+            "session_id": session_id,
+            "error": str(e),
+            "execution_time": duration
+        })
+        
+        # Return consistent JSON response format for errors
+        error_response = {
+            "is_success": True,
+            "message": "success",
+            "data": {
+                "session_id": session_id,
+                "trace_id": trace_id,
+                "type": "error",
+                "sql_query": None,
+                "filtered_sql": None,
+                "content": None,
+                "chart_data": None,
+                "error": error_message,
+                "data": None,
+                "execution_time": f"{duration:.2f}s",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "session_status": "Error"
+            }
+        }
+        
+        return sanitize_json_data(error_response)
 
 # ============== SESSION MANAGEMENT ENDPOINTS (UPDATED) ==============
 
 @app.get("/sessions")
-def get_sessions():
-    """Return session info from permanent storage"""
+def get_sessions(page: int = 1, page_size: int = 20, user_id: str = None):
+    """Return session info from permanent storage with pagination and optional user filtering"""
+    logger.info(f"Fetching sessions from permanent storage - page {page}, size {page_size}, user_id {user_id}")
+    
+    # Validate pagination parameters
+    if page < 1:
+        page = 1
+    if page_size < 1 or page_size > 2:  # Limit max page size to 100
+        page_size = 2
+    
+    offset = (page - 1) * page_size
+    
     try:
         conn = get_postgres_conn()
         cur = conn.cursor()
         
+        # Get total count for pagination metadata with optional user filter
+
         cur.execute("""
-            SELECT session_id, 
-                   COUNT(*) as message_count,
-                   MIN(timestamp) as first_message,
-                   MAX(timestamp) as last_message,
-                   MIN(CASE WHEN message_type = 'human' THEN content END) as first_question
-            FROM conversation_messages 
-            GROUP BY session_id 
-            ORDER BY MAX(timestamp) DESC 
-            LIMIT 20
-        """)
+            SELECT COUNT(DISTINCT cs.session_id) as total_sessions
+            FROM chat_sessions cs
+            WHERE cs.user_id = %s
+        """, (user_id,))
+        total_sessions = cur.fetchone()[0]
+        
+        # Calculate pagination metadata
+        total_pages = (total_sessions + page_size - 1) // page_size
+        has_next = page < total_pages
+        has_prev = page > 1
+        
+        # Get paginated sessions with optional user filter
+        cur.execute("""
+            SELECT cs.session_id, cs.user_id, cs.session_status, cs.created_at, cs.last_message_at,
+                    COUNT(cm.message_id) as message_count,
+                    MIN(CASE WHEN cm.role = 'user' THEN cm.content END) as first_question
+            FROM chat_sessions cs
+            LEFT JOIN chat_messages cm ON cs.session_id = cm.session_id
+            WHERE cs.user_id = %s
+            GROUP BY cs.session_id, cs.user_id, cs.session_status, cs.created_at, cs.last_message_at
+            ORDER BY cs.last_message_at DESC 
+            LIMIT %s OFFSET %s
+        """, (user_id, page_size, offset))
+
         
         sessions = cur.fetchall()
         cur.close()
         
         session_list = []
         for row in sessions:
-            session_id, msg_count, first_msg, last_msg, first_q = row
+            session_id, user_id, session_status, created_at, last_message_at, msg_count, first_q = row
             session_list.append({
-                "session_id": session_id,
+                "session_id": str(session_id),
+                "user_id": user_id,
+                "session_status": session_status,
                 "message_count": msg_count,
-                "first_message": first_msg.isoformat() if first_msg else None,
-                "last_message": last_msg.isoformat() if last_msg else None,
+                "created_at": created_at.isoformat() if created_at else None,
+                "last_message_at": last_message_at.isoformat() if last_message_at else None,
                 "first_question": (first_q[:50] + "...") if first_q and len(first_q) > 50 else first_q
             })
         
         return {
-            "message": "Sessions with ConversationSummaryBufferMemory",
-            "memory_type": "ConversationSummaryBufferMemory + PostgreSQL",
-            "active_memories": len(conversation_memories),
-            "sessions": session_list
+            "is_success": True,
+            "message": "success",
+            "data": {
+                "message": f"Sessions with ConversationSummaryBufferMemory{' for user ' + user_id if user_id else ''}",
+                "memory_type": "ConversationSummaryBufferMemory + PostgreSQL",
+                "active_memories": len(conversation_memories),
+                "sessions": session_list,
+                "user_filter": user_id,
+                "pagination": {
+                    "current_page": page,
+                    "page_size": page_size,
+                    "total_sessions": total_sessions,
+                    "total_pages": total_pages,
+                    "has_next": has_next,
+                    "has_prev": has_prev,
+                    "next_page": page + 1 if has_next else None,
+                    "prev_page": page - 1 if has_prev else None
+                }
+            }
         }
     except Exception as e:
         logger.error(f"Failed to get sessions: {e}")
-        return {"error": str(e)}
+        return {
+            "is_success": False,
+            "message": str(e),
+            "data": None
+        }
     finally:
         if 'conn' in locals():
             release_postgres_conn(conn)
 
 @app.get("/session/{session_id}")
 def get_session_info(session_id: str):
-    """Get session info with full message details including charts for frontend rendering"""
+    """Get session info with full message details including charts and token usage for frontend rendering"""
     try:
         conn = get_postgres_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
-        # Get all messages with rich metadata
+        # Get all messages with rich metadata including tokens
         cur.execute("""
-            SELECT message_type, content, sql_query, filtered_sql, chart_data, result_data, execution_time, timestamp
-            FROM conversation_messages 
-            WHERE session_id = %s 
-            ORDER BY timestamp ASC
+            SELECT cm.role, cm.content, cm.sql_query, cm.filtered_sql, cm.chart_data, 
+                   cm.result_data, cm.execution_time, cm.error, cm.langfuse_trace_id, 
+                   cm.input_tokens, cm.output_tokens, cm.created_at, cs.session_status,
+                   cm.created_at,cm.updated_at
+            FROM chat_messages cm
+            JOIN chat_sessions cs ON cm.session_id = cs.session_id
+            WHERE cm.session_id = %s 
+            ORDER BY cm.created_at ASC
         """, (session_id,))
         
         db_messages = cur.fetchall()
@@ -1581,14 +1855,15 @@ def get_session_info(session_id: str):
         release_postgres_conn(conn)
         
         messages = []
+        total_session_tokens = 0
         for row in db_messages:
             msg = {
-                "type": "user" if row["message_type"] == "human" else "assistant" if row["message_type"] == "ai" else "summary",
+                "type": "user" if row["role"] == "user" else "assistant" if row["role"] == "assistant" else "summary",
                 "content": row["content"]
             }
             
             # Add rich metadata for assistant messages
-            if row["message_type"] == "ai":
+            if row["role"] == "assistant":
                 if row.get("sql_query"):
                     msg["sql_query"] = row["sql_query"]
                 if row.get("filtered_sql"):
@@ -1599,46 +1874,80 @@ def get_session_info(session_id: str):
                     msg["data"] = row["result_data"]  # Already parsed from JSONB
                 if row.get("execution_time"):
                     msg["execution_time"] = row["execution_time"]
+                if row.get("error"):
+                    msg["error"] = row["error"]
+                if row.get("langfuse_trace_id"):
+                    msg["trace_id"] = row["langfuse_trace_id"]
+                msg["input_tokens"] = row.get("input_tokens") or 0
+                msg["output_tokens"] = row.get("output_tokens") or 0
+                msg["created_at"] = row.get("created_at").isoformat() if row.get("created_at") else None
+                msg["updated_at"] = row.get("updated_at").isoformat() if row.get("updated_at") else None
+                
             
             messages.append(msg)
         
         # Also check active memory for current state
         is_active = session_id in conversation_memories
-        
         return {
-            "session_id": session_id,
-            "memory_type": "Active in memory" if is_active else "Loaded from PostgreSQL",
-            "total_messages": len(messages),
-            "messages": messages
+            "is_success": True,
+            "message": "success",
+            "data": {
+                "session_id": session_id,
+                "session_status": db_messages[0]["session_status"] if db_messages else "Unknown",
+                "total_messages": len(messages),
+                "total_session_tokens": total_session_tokens,
+                "messages": messages
+            }
         }
     except Exception as e:
         logger.error(f"Failed to get session info: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "is_success": False,
+            "message": str(e),
+            "data": None
+        }
 
 @app.delete("/session/{session_id}")
 def clear_session_memory(session_id: str):
     """Clear session from memory and permanent storage"""
+    logger.info(f"Clearing session {session_id} from memory and storage")
     try:
         # Remove from active memory
         if session_id in conversation_memories:
             del conversation_memories[session_id]
             logger.info(f"Removed session {session_id} from active memory")
         
-        # Remove from permanent storage
+        # Remove from permanent storage - deleting from chat_sessions will cascade delete messages
         conn = get_postgres_conn()
         cur = conn.cursor()
-        cur.execute("DELETE FROM conversation_messages WHERE session_id = %s", (session_id,))
-        deleted_count = cur.rowcount
+        
+        # First count the messages that will be deleted
+        cur.execute("SELECT COUNT(*) FROM chat_messages WHERE session_id = %s", (session_id,))
+        message_count = cur.fetchone()[0]
+        
+        # Delete the session (this will cascade delete all messages)
+        cur.execute("DELETE FROM chat_sessions WHERE session_id = %s", (session_id,))
+        
         conn.commit()
         cur.close()
         
+        logger.info(f"Session {session_id} cleared successfully, deleted {message_count} messages")
         return {
-            "message": "Session cleared from both memory and permanent storage",
-            "session_id": session_id,
-            "deleted_messages": deleted_count
+            "is_success": True,
+            "message": "success",
+            "data": {
+                "message": "Session cleared from both memory and permanent storage",
+                "session_id": session_id,
+                "deleted_messages": message_count,
+            }
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to clear session {session_id}: {e}")
+        return {
+            "is_success": False,
+            "message": str(e),
+            "data": None
+        }
     finally:
         if 'conn' in locals():
             release_postgres_conn(conn)
@@ -1697,13 +2006,19 @@ async def startup_event():
     """Initialize resources on startup"""
     global langfuse_handler
     
+    logger.info("Application startup initiated")
+    
     init_connection_pools()
     init_conversation_tables()
     
     # Re-initialize Langfuse handler in case env vars are now available
     if langfuse_handler is None:
         logger.info("Re-attempting Langfuse initialization on startup...")
-        langfuse_handler = create_langfuse_handler()
+        try:
+            langfuse_handler = CallbackHandler()
+            logger.info("Langfuse handler initialized on startup")
+        except Exception as e:
+            logger.warning(f"Langfuse initialization failed on startup: {e}")
     
     logger.info("Application started successfully", extra={
         "event": "startup", 
