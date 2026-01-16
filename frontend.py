@@ -33,43 +33,65 @@ def load_session_from_backend(session_id):
     """Load conversation history from backend database"""
     try:
         response = requests.get(f"{BACKEND_URL}/session/{session_id}", timeout=5)
-        if response.status_code == 200:
-            session_data = response.json()
-            if session_data.get("messages"):
-                messages = []
-                for msg in session_data["messages"]:
-                    # Backend now returns rich message data
-                    msg_type = msg.get("type", "user")
-                    if msg_type == "user":
-                        messages.append({
-                            "role": "user", 
-                            "content": msg["content"]
-                        })
-                    elif msg_type == "assistant":
-                        # Build rich assistant message with all metadata
-                        assistant_msg = {
-                            "role": "assistant", 
-                            "content": msg["content"]
-                        }
-                        
-                        # Add rich metadata if available
-                        if msg.get("chart_data"):
-                            assistant_msg["chart_data"] = msg["chart_data"]
-                        if msg.get("sql_query"):
-                            assistant_msg["sql_query"] = msg["sql_query"]
-                        if msg.get("filtered_sql"):
-                            assistant_msg["filtered_sql"] = msg["filtered_sql"]
-                        if msg.get("data"):
-                            assistant_msg["data"] = msg["data"]
-                        if msg.get("execution_time"):
-                            assistant_msg["execution_time"] = msg["execution_time"]
-                            
-                        messages.append(assistant_msg)
-                    # Skip "summary" type messages for display
-                st.session_state.chat_messages = messages
-                st.session_state.current_conversation_title = messages[0]["content"][:50] if messages else None
-                return True
-        return False
+        if response.status_code != 200:
+            return False
+
+        payload = response.json()
+        if not payload.get("is_success"):
+            return False
+
+        data = payload.get("data", {})
+        backend_messages = data.get("messages", [])
+
+        if not backend_messages:
+            return False
+
+        messages = []
+        for msg in backend_messages:
+            msg_type = msg.get("type", "user")
+
+            if msg_type == "user":
+                messages.append({
+                    "role": "user",
+                    "content": msg["content"]
+                })
+
+            elif msg_type == "assistant":
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": msg["content"]
+                }
+
+                if msg.get("chart_data"):
+                    assistant_msg["chart_data"] = msg["chart_data"]
+                if msg.get("sql_query"):
+                    assistant_msg["sql_query"] = msg["sql_query"]
+                if msg.get("filtered_sql"):
+                    assistant_msg["filtered_sql"] = msg["filtered_sql"]
+                if msg.get("data"):
+                    assistant_msg["data"] = msg["data"]
+                if msg.get("execution_time"):
+                    assistant_msg["execution_time"] = msg["execution_time"]
+                if msg.get("error"):
+                    assistant_msg["error"] = msg["error"]
+                if msg.get("trace_id"):
+                    assistant_msg["trace_id"] = msg["trace_id"]
+                if msg.get("session_status"):
+                    assistant_msg["session_status"] = msg["session_status"]
+                
+                # Handle token usage data
+                if msg.get("input_tokens") is not None or msg.get("output_tokens") is not None:
+                    assistant_msg["token_usage"] = {
+                        "input_tokens": msg.get("input_tokens", 0),
+                        "output_tokens": msg.get("output_tokens", 0)
+                    }
+
+                messages.append(assistant_msg)
+
+        st.session_state.chat_messages = messages
+        st.session_state.current_conversation_title = messages[0]["content"][:50]
+        return True
+
     except Exception as e:
         st.error(f"Failed to load session: {e}")
         return False
@@ -77,21 +99,23 @@ def load_session_from_backend(session_id):
 def get_available_sessions():
     """Get list of available sessions from backend with caching"""
     try:
-        # Use cached sessions if available and fresh (within 5 seconds)
         if "cached_sessions" in st.session_state and "cache_time" in st.session_state:
             if time.time() - st.session_state.cache_time < 5:
                 return st.session_state.cached_sessions
-        
-        # Fetch fresh data
+
         response = requests.get(f"{BACKEND_URL}/sessions", timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            sessions = data.get("sessions", [])
-            # Cache the results
-            st.session_state.cached_sessions = sessions
-            st.session_state.cache_time = time.time()
-            return sessions
-        return []
+        if response.status_code != 200:
+            return []
+
+        payload = response.json()
+        if not payload.get("is_success"):
+            return []
+
+        sessions = payload.get("data", {}).get("sessions", [])
+        st.session_state.cached_sessions = sessions
+        st.session_state.cache_time = time.time()
+        return sessions
+
     except Exception:
         return []
 
@@ -260,7 +284,7 @@ for i, message in enumerate(st.session_state.chat_messages):
     else:
         with st.chat_message("assistant"):
             chart_data = message.get("chart_data")
-            summary = chart_data.get("summary") if chart_data else None
+            summary =  message.get("content")
             chart_type = chart_data.get("chart_type") if chart_data else None
 
             # Show summary unless it's a 'no chart needed' message and no chart is shown
@@ -385,18 +409,28 @@ if user_input:
                 )
                 
                 if response.status_code == 200:
-                    data = response.json()
+                    response_json = response.json()
                     
-                    if data.get("error"):
-                        error_msg = f"❌ Error: {data['error']}"
+                    if response_json.get("error"):
+                        error_msg = f"❌ Error: {response_json['error']}"
                         st.error(error_msg)
+                        
+                        # Handle error response with execution time if available
+                        error_data = response_json.get("data", {})
+                        exec_time = error_data.get("execution_time", "N/A")
+                        
                         st.session_state.chat_messages.append({
                             "role": "assistant",
                             "content": error_msg,
-                            "error": data["error"]
+                            "error": response_json["error"],
+                            "execution_time": exec_time,
+                            "trace_id": response_json.get("trace_id"),
+                            "session_status": "Error"
                         })
                     else:
-                        summary = data.get("summary", "Query completed successfully")
+                        # Extract data from nested structure
+                        data = response_json.get("data", {})
+                        summary = data.get("content", "Query completed successfully")
                         st.write(summary)
                         
                         # SQL query hidden for client demo
@@ -404,7 +438,8 @@ if user_input:
                         #     with st.expander("🔍 SQL Query"):
                         #         st.code(data["filtered_sql"], language="sql")
                         
-                        chart_data = data.get("chart")
+                        chart_data = data.get("chart_data")
+                        result_data = data.get("data", [])
                         if chart_data and chart_data.get("chart_type"):
                             try:
                                 chart_type = chart_data["chart_type"]
@@ -412,8 +447,8 @@ if user_input:
                                 if chart_type == "table":
                                     # Display data in enhanced table format
                                     st.subheader(chart_data.get("title", "Data Table"))
-                                    if data.get("data"):
-                                        df = pd.DataFrame(data["data"])
+                                    if result_data:
+                                        df = pd.DataFrame(result_data)
                                         st.dataframe(df, use_container_width=True, height=400)
                                         
                                         # Add download option
@@ -496,9 +531,9 @@ if user_input:
                             except Exception as e:
                                 st.error(f"Chart error: {e}")
                         
-                        if data.get("data"):
-                            with st.expander(f"📄 Data ({len(data['data'])} rows)"):
-                                df = pd.DataFrame(data["data"])
+                        if result_data:
+                            with st.expander(f"📄 Data ({len(result_data)} rows)"):
+                                df = pd.DataFrame(result_data)
                                 st.dataframe(df, use_container_width=True)
                                 
                                 csv = df.to_csv(index=False)
@@ -515,16 +550,26 @@ if user_input:
                         if data.get("execution_time"):
                             st.caption(f"⏱️ Completed in {data['execution_time']}")
                         
-                        st.session_state.chat_messages.append({
+                        # Store assistant message with all metadata
+                        assistant_message = {
                             "role": "assistant",
                             "content": summary,
-                            "sql_query": data.get("original_sql"),
+                            "sql_query": data.get("sql_query"),
                             "filtered_sql": data.get("filtered_sql"),
                             "chart_data": chart_data,
-                            "data": data.get("data", []),  # Add data to session state
-                            "result_count": len(data.get("data", [])),
-                            "execution_time": float(data.get("execution_time", "0").replace("s", ""))
-                        })
+                            "data": result_data,
+                            "result_count": len(result_data),
+                            "execution_time": float(data.get("execution_time", "0s").replace("s", "")),
+                            "trace_id": response_json.get("trace_id"),
+                            "session_status": "Completed"
+                        }
+                        
+                        # Add token usage if available
+                        if data.get("input_tokens", 0) > 0 or data.get("output_tokens", 0) > 0:
+                            assistant_message["input_tokens"] = data.get("input_tokens", 0)
+                            assistant_message["output_tokens"] = data.get("output_tokens", 0)
+                        
+                        st.session_state.chat_messages.append(assistant_message)
                 
                 else:
                     error_msg = f"❌ Server error: {response.status_code}"
