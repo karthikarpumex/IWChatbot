@@ -30,3 +30,4 @@ plotly>=5.20.0
 
 # Utilities
 uuid6>=2024.1
+python-logging-loki

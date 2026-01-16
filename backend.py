@@ -99,25 +99,24 @@ def init_connection_pools():
     global pg_pool, clickhouse_client
 
     pg_pool = pool.ThreadedConnectionPool(
-        minconn=2,
-        maxconn=10,
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=int(os.getenv("POSTGRES_PORT", "5432")),
-        database=os.getenv("POSTGRES_DB", "chat_history"),
-        user=os.getenv("POSTGRES_USER", "postgres"),
-        password=os.getenv("POSTGRES_PASSWORD", "postgres")
-    )
+                minconn=2,
+                maxconn=10,
+                host=os.getenv("POSTGRES_HOST", "localhost"),
+                port=int(os.getenv("POSTGRES_PORT", "5433")),
+                database=os.getenv("POSTGRES_DB", "chatbot_db"),
+                user=os.getenv("POSTGRES_USER", "chatbot"),
+                password=os.getenv("POSTGRES_PASSWORD", "chatbot_secure_pass")
+            )
     
     clickhouse_client = clickhouse_connect.get_client(
         host=os.getenv("CLICKHOUSE_HOST", "localhost"),
         port=int(os.getenv("CLICKHOUSE_PORT", "8123")),
         username=os.getenv("CLICKHOUSE_USER", "default"),
-        password=os.getenv("CLICKHOUSE_PASSWORD", ""),
+        password=os.getenv("CLICKHOUSE_PASSWORD", "password"),
         database=os.getenv("CLICKHOUSE_DATABASE", "iw_dev")
     )
 
     logger.info("✅ Connection pools initialized")
-
 
 # ============== LANGFUSE SETUP ==============
 
