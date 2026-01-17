@@ -1,0 +1,49 @@
+version: '3.8'
+
+# Standalone Langfuse - Run separately from main app
+# Start with: docker-compose -f langfuse-standalone.yml up -d
+# Access at: http://localhost:3001
+
+services:
+  langfuse-db:
+    image: postgres:14
+    container_name: langfuse-db
+    environment:
+      POSTGRES_DB: langfuse
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - langfuse_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: langfuse-server
+    ports:
+      - "3001:3000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@langfuse-db:5432/langfuse
+      - NEXTAUTH_SECRET=mysecret-change-in-production-123456
+      - NEXTAUTH_URL=http://localhost:3001
+      - SALT=mysalt-change-in-production-789012
+      - TELEMETRY_ENABLED=true
+      - LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES=false
+      - NEXT_PUBLIC_SIGN_UP_DISABLED=false
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/public/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+
+volumes:
+  langfuse_db_data:

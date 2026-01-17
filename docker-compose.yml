@@ -1,0 +1,104 @@
+name: iwchatbot
+
+services:
+  # =========================
+  # Backend API
+  # =========================
+  iw-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: iw-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    networks:
+      - iw-network
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # =========================
+  # PostgreSQL (Chat History)
+  # =========================
+  postgres:
+    image: postgres:16
+    container_name: iw-postgres
+    environment:
+      POSTGRES_DB: chat_history
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "15432:5432"
+    volumes:
+      - iw_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - iw-network
+    restart: unless-stopped
+
+  # =========================
+  # Loki (Logs)
+  # =========================
+  loki:
+    image: grafana/loki:2.9.3
+    container_name: iw-loki
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+    networks:
+      - iw-network
+    restart: unless-stopped
+
+  # =========================
+  # Grafana
+  # =========================
+  grafana:
+    image: grafana/grafana:10.2.3
+    container_name: iw-grafana
+    depends_on:
+      - loki
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3002:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+    networks:
+      - iw-network
+    restart: unless-stopped
+
+# =========================
+# Network
+# =========================
+networks:
+  iw-network:
+    driver: bridge
+
+# =========================
+# Volumes
+# =========================
+volumes:
+  iw_postgres_data:
+    driver: local
+  grafana_data:
+    driver: local
+  loki_data:
+    driver: local
