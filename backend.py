@@ -14,6 +14,8 @@ from psycopg2.extras import RealDictCursor
 import os
 from datetime import datetime
 from dotenv import load_dotenv
+from decimal import Decimal
+from fastapi.middleware.cors import CORSMiddleware
 
 # Disable OpenTelemetry auto-instrumentation
 #os.environ["OTEL_SDK_DISABLED"] = "true"
@@ -286,8 +288,8 @@ def save_to_permanent_storage(
         role = 'user' if message_type == 'human' else 'assistant' if message_type == 'ai' else message_type
         
         # Convert chart data to JSON string if provided
-        chart_json = json.dumps(chart_data) if chart_data else None
-        result_json = json.dumps(result_data) if result_data else None
+        chart_json = json.dumps(sanitize_json_data(chart_data)) if chart_data else None
+        result_json = json.dumps(sanitize_json_data(result_data)) if result_data else None
         
         cur.execute("""
             INSERT INTO chat_messages 
@@ -802,6 +804,7 @@ COMMON QUERY PATTERNS:
 - Dues status check: SELECT firstname, lastname, CASE WHEN toDate(paidthru) >= today() THEN 'Current' ELSE 'Delinquent' END AS dues_status FROM iw_dev.iw_contact08 WHERE localunionid = '782'
 - Drug testing compliance: SELECT CASE WHEN test_status__c = 'C' AND toDate(drug_test_completion_date__c) >= today() - INTERVAL 1 YEAR THEN 'Negative/Current' WHEN test_status__c = 'C' THEN 'Negative/Expired' WHEN test_status__c = 'X' THEN 'Need to Test' WHEN test_status__c = 'I' THEN 'Ineligible' ELSE COALESCE(test_status__c, 'Unknown') END AS status, COUNT(*) AS count FROM iw_dev.drugtestrecords WHERE drug_test_completion_date__c IS NOT NULL AND drug_test_completion_date__c != '' GROUP BY status
 - Training trends by year: SELECT coursename, toInt32(year) AS course_year, COUNT(*) AS enrollments FROM iw_dev.member_course_history WHERE toInt32(year) >= 2020 GROUP BY coursename, course_year ORDER BY course_year DESC, enrollments DESC LIMIT 100
+- Total hours worked for a company in a year (case-insensitive, partial match):SELECT SUM(hours) AS total_hours FROM iw_dev.employmenthistory WHERE lower(companyname) LIKE '%superior steel%' AND year = '2024'
 
 OUTPUT FORMAT:
 =============
@@ -1215,6 +1218,9 @@ def sanitize_json_data(obj):
         return {key: sanitize_json_data(value) for key, value in obj.items()}
     elif isinstance(obj, list):
         return [sanitize_json_data(item) for item in obj]
+    elif isinstance(obj, Decimal):
+        # Convert Decimal to float for JSON serialization
+        return float(obj)
     elif isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
             return None
@@ -2034,6 +2040,20 @@ async def startup_event():
         "langfuse_enabled": langfuse_handler is not None
     })
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3001",
+        "http://localhost:3002",
+        "http://localhost:5187",
+        "http://localhost:5188",
+        "http://192.168.29.31:5187",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
@@ -2050,4 +2070,4 @@ async def shutdown_event():
 if __name__ == "__main__":
     init_connection_pools()
     init_conversation_tables()
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("backend:app", host="0.0.0.0", port=8000,reload=True)
