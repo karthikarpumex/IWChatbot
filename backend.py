@@ -36,6 +36,7 @@ import math
 import threading
 from functools import wraps
 import logging
+from decimal import Decimal
 
 # Optional logging_loki import
 try:
@@ -285,9 +286,26 @@ def save_to_permanent_storage(
         # Convert role from old format to new format
         role = 'user' if message_type == 'human' else 'assistant' if message_type == 'ai' else message_type
         
-        # Convert chart data to JSON string if provided
-        chart_json = json.dumps(chart_data) if chart_data else None
-        result_json = json.dumps(result_data) if result_data else None
+        # Convert chart data to JSON string - save STRUCTURE ONLY (no data)
+        if chart_data:
+            # Extract series config from chart and data
+            series_config = extract_series_config(chart_data, result_data) if result_data else None
+            
+            # Save only chart structure (no x_values, y_values, series_data)
+            chart_structure = {
+                'chart_type': chart_data.get('chart_type'),
+                'title': chart_data.get('title'),
+                'x_label': chart_data.get('x_label'),
+                'y_label': chart_data.get('y_label'),
+                'summary': chart_data.get('summary'),
+                'series_config': series_config  # Metadata for regeneration
+            }
+            chart_json = json.dumps(chart_structure)
+        else:
+            chart_json = None
+        
+        # DON'T save result_data (too large, not needed for regeneration)
+        result_json = None
         
         cur.execute("""
             INSERT INTO chat_messages 
@@ -802,6 +820,7 @@ COMMON QUERY PATTERNS:
 - Dues status check: SELECT firstname, lastname, CASE WHEN toDate(paidthru) >= today() THEN 'Current' ELSE 'Delinquent' END AS dues_status FROM iw_dev.iw_contact08 WHERE localunionid = '782'
 - Drug testing compliance: SELECT CASE WHEN test_status__c = 'C' AND toDate(drug_test_completion_date__c) >= today() - INTERVAL 1 YEAR THEN 'Negative/Current' WHEN test_status__c = 'C' THEN 'Negative/Expired' WHEN test_status__c = 'X' THEN 'Need to Test' WHEN test_status__c = 'I' THEN 'Ineligible' ELSE COALESCE(test_status__c, 'Unknown') END AS status, COUNT(*) AS count FROM iw_dev.drugtestrecords WHERE drug_test_completion_date__c IS NOT NULL AND drug_test_completion_date__c != '' GROUP BY status
 - Training trends by year: SELECT coursename, toInt32(year) AS course_year, COUNT(*) AS enrollments FROM iw_dev.member_course_history WHERE toInt32(year) >= 2020 GROUP BY coursename, course_year ORDER BY course_year DESC, enrollments DESC LIMIT 100
+- Total hours worked for a company in a year (case-insensitive, partial match):SELECT SUM(hours) AS total_hours FROM iw_dev.employmenthistory WHERE lower(companyname) LIKE '%superior steel%' AND year = '2024'
 
 OUTPUT FORMAT:
 =============
@@ -1215,6 +1234,9 @@ def sanitize_json_data(obj):
         return {key: sanitize_json_data(value) for key, value in obj.items()}
     elif isinstance(obj, list):
         return [sanitize_json_data(item) for item in obj]
+    elif isinstance(obj, Decimal):
+        # Convert Decimal to float for JSON serialization
+        return float(obj)
     elif isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
             return None
@@ -1228,6 +1250,404 @@ def create_sql_prompt_with_history(question: str, messages: list[BaseMessage]) -
     recent_messages = messages[-10:] if len(messages) > 10 else messages
     current_question = HumanMessage(content=f"USER QUESTION: {question}\n\nGenerate the SQL query based on the schema and rules provided.")
     return [system_message] + recent_messages + [current_question]
+
+def extract_series_config(chart_data: dict, raw_data: list[dict]) -> dict | None:
+    """
+    Extract series configuration from chart data and raw query results.
+    This allows us to recreate the same chart structure with fresh data.
+    """
+    if not chart_data or not raw_data:
+        return None
+    
+    chart_type = chart_data.get('chart_type')
+    
+    if chart_type == 'multi_line':
+        # For multi-line charts, figure out which column maps to what
+        data_columns = list(raw_data[0].keys())
+        
+        # Find y_column: MUST be numeric in ALL rows (not just first)
+        y_column = None
+        for col in data_columns:
+            # Check if this column is numeric across multiple rows
+            is_numeric = True
+            for row in raw_data[:5]:  # Check first 5 rows
+                val = row.get(col)
+                if not isinstance(val, (int, float, Decimal)):
+                    is_numeric = False
+                    break
+            if is_numeric:
+                y_column = col
+                break
+        
+        # Find x_column: Look for column that could be x-axis
+        # Try to match against x_values (with some flexibility)
+        x_column = None
+        x_values = chart_data.get('x_values', [])
+        if x_values:
+            for col in data_columns:
+                if col == y_column:
+                    continue
+                # Check if values in this column appear in x_values (even partially)
+                sample_val = str(raw_data[0].get(col, ''))
+                for x_val in x_values[:3]:  # Check first few x_values
+                    if sample_val in str(x_val) or str(x_val) in sample_val:
+                        x_column = col
+                        break
+                if x_column:
+                    break
+        
+        # If x_column still not found, use first non-numeric column
+        if not x_column:
+            for col in data_columns:
+                if col != y_column:
+                    x_column = col
+                    break
+        
+        # Find series_column: remaining column (not x or y)
+        series_column = None
+        for col in data_columns:
+            if col != x_column and col != y_column:
+                series_column = col
+                break
+        
+        return {
+            "x_column": x_column,
+            "series_column": series_column,
+            "y_column": y_column
+        }
+    
+    elif chart_type in ['bar', 'line', 'pie']:
+        # Simple charts - x and y
+        data_columns = list(raw_data[0].keys())
+        
+        # Find y_column: numeric column
+        y_column = None
+        for col in data_columns:
+            val = raw_data[0].get(col)
+            if isinstance(val, (int, float, Decimal)):
+                y_column = col
+                break
+        
+        # x_column: first non-numeric column
+        x_column = None
+        for col in data_columns:
+            if col != y_column:
+                x_column = col
+                break
+        
+        return {
+            "x_column": x_column,
+            "y_column": y_column
+        }
+    
+    return None
+
+def rebuild_chart_from_config(data: list[dict], config: dict) -> dict:
+    """
+    Rebuild chart using saved config + fresh data.
+    Returns chart WITHOUT summary (summary added separately).
+    """
+    chart_type = config.get('chart_type')
+    series_config = config.get('series_config')
+    
+    if chart_type == 'multi_line' and series_config:
+        x_col = series_config.get('x_column')
+        series_col = series_config.get('series_column')
+        y_col = series_config.get('y_column')
+        
+        # Validate that we have the required columns
+        if not all([x_col, series_col, y_col]):
+            logger.error(f"Missing required columns in series_config: {series_config}")
+            raise ValueError(f"Invalid series configuration: missing columns")
+        
+        # Get unique x values and series names
+        x_values = sorted(set(str(row[x_col]) for row in data if x_col in row))
+        series_names = sorted(set(str(row[series_col]) for row in data if series_col in row))
+        
+        # Initialize series_data
+        series_data = {}
+        for series_name in series_names:
+            # Format series name nicely
+            if series_col == 'localunionid':
+                formatted_name = f"Local {series_name}"
+            else:
+                formatted_name = series_name
+            series_data[formatted_name] = []
+        
+        # Fill in values for each x_value
+        for x_val in x_values:
+            for series_name in series_names:
+                # Find matching row
+                matching_row = next(
+                    (row for row in data 
+                     if str(row.get(x_col, '')) == x_val and str(row.get(series_col, '')) == series_name),
+                    None
+                )
+                
+                # Format series name for lookup
+                if series_col == 'localunionid':
+                    formatted_name = f"Local {series_name}"
+                else:
+                    formatted_name = series_name
+                
+                if matching_row and y_col in matching_row:
+                    try:
+                        # Try to convert to float
+                        y_value = matching_row[y_col]
+                        if isinstance(y_value, (int, float, Decimal)):
+                            series_data[formatted_name].append(float(y_value))
+                        else:
+                            # If not numeric, log error and use 0
+                            logger.warning(f"Non-numeric value in y_column '{y_col}': {y_value} (type: {type(y_value).__name__})")
+                            series_data[formatted_name].append(0)
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"Failed to convert y_value to float: {matching_row.get(y_col)} - {e}")
+                        series_data[formatted_name].append(0)
+                else:
+                    series_data[formatted_name].append(0)
+        
+        return {
+            "chart_type": "multi_line",
+            "title": config.get('title', ''),
+            "x_label": config.get('x_label', ''),
+            "y_label": config.get('y_label', ''),
+            "x_values": x_values,
+            "series_data": series_data,
+        }
+    
+    elif chart_type in ['bar', 'line', 'pie'] and series_config:
+        x_col = series_config.get('x_column')
+        y_col = series_config.get('y_column')
+        
+        if not all([x_col, y_col]):
+            logger.error(f"Missing required columns in series_config: {series_config}")
+            raise ValueError(f"Invalid series configuration: missing columns")
+        
+        x_values = []
+        y_values = []
+        
+        for row in data:
+            if x_col in row and y_col in row:
+                x_values.append(str(row[x_col]))
+                try:
+                    y_value = row[y_col]
+                    if isinstance(y_value, (int, float, Decimal)):
+                        y_values.append(float(y_value))
+                    else:
+                        logger.warning(f"Non-numeric value in y_column '{y_col}': {y_value}")
+                        y_values.append(0)
+                except (ValueError, TypeError) as e:
+                    logger.error(f"Failed to convert y_value to float: {row.get(y_col)} - {e}")
+                    y_values.append(0)
+        
+        return {
+            "chart_type": chart_type,
+            "title": config.get('title', ''),
+            "x_label": config.get('x_label', ''),
+            "y_label": config.get('y_label', ''),
+            "x_values": x_values,
+            "y_values": y_values,
+        }
+    
+    else:
+        # Table or other types - return basic structure
+        return {
+            "chart_type": chart_type,
+            "title": config.get('title', ''),
+            "x_label": config.get('x_label', ''),
+            "y_label": config.get('y_label', ''),
+        }
+
+def update_summary_numbers(old_summary: str, old_chart: dict, new_chart: dict) -> str:
+    """
+    Update numbers in summary to match fresh data without calling agent.
+    Preserves original phrasing, just updates the values.
+    
+    Example:
+    Old: "Caleb Redman leads with 137 courses"
+    New: "Caleb Redman leads with 139 courses"
+    """
+    import re
+    
+    try:
+        updated_summary = old_summary
+        chart_type = old_chart.get('chart_type')
+        
+        if chart_type in ['bar', 'line', 'pie']:
+            # For simple charts, replace y_values
+            old_values = old_chart.get('y_values', [])
+            new_values = new_chart.get('y_values', [])
+            old_x_values = old_chart.get('x_values', [])
+            new_x_values = new_chart.get('x_values', [])
+            
+            if len(old_values) == len(new_values):
+                # Create a mapping of old value → new value
+                value_map = {}
+                for i, (old_val, new_val) in enumerate(zip(old_values, new_values)):
+                    if old_val != new_val:
+                        value_map[old_val] = new_val
+                
+                # Replace each old value with new value in summary
+                for old_val, new_val in value_map.items():
+                    # Format numbers consistently (remove decimals if .0)
+                    old_str = str(int(old_val)) if old_val == int(old_val) else str(old_val)
+                    new_str = str(int(new_val)) if new_val == int(new_val) else str(new_val)
+                    
+                    # Replace the number (with word boundaries to avoid partial matches)
+                    pattern = r'\b' + re.escape(old_str) + r'\b'
+                    updated_summary = re.sub(pattern, new_str, updated_summary)
+                    
+                    logger.info(f"Updated summary: {old_str} → {new_str}")
+        
+        elif chart_type == 'multi_line':
+            # For multi-line charts, update series totals
+            old_series = old_chart.get('series_data', {})
+            new_series = new_chart.get('series_data', {})
+            
+            for series_name in old_series.keys():
+                if series_name in new_series:
+                    old_total = sum(old_series[series_name])
+                    new_total = sum(new_series[series_name])
+                    
+                    if old_total != new_total:
+                        old_str = str(int(old_total)) if old_total == int(old_total) else str(old_total)
+                        new_str = str(int(new_total)) if new_total == int(new_total) else str(new_total)
+                        
+                        # Replace in context of the series name
+                        # Look for patterns like "Local 377 with 120" or "377: 120"
+                        pattern = r'\b' + re.escape(old_str) + r'\b'
+                        updated_summary = re.sub(pattern, new_str, updated_summary)
+                        
+                        logger.info(f"Updated {series_name}: {old_str} → {new_str}")
+        
+        return updated_summary
+        
+    except Exception as e:
+        logger.warning(f"Failed to update summary numbers: {e}")
+        # On error, return original summary
+        return old_summary
+
+def should_regenerate_summary(old_chart: dict, new_chart: dict) -> bool:
+    """
+    Determine if summary should be regenerated based on data changes.
+    Returns True if data changed significantly (>10% change in key metrics).
+    """
+    try:
+        chart_type = old_chart.get('chart_type')
+        
+        if chart_type == 'multi_line':
+            # For multi-line charts, compare series totals
+            old_series = old_chart.get('series_data', {})
+            new_series = new_chart.get('series_data', {})
+            
+            # Check if series changed
+            if set(old_series.keys()) != set(new_series.keys()):
+                return True  # Different series = regenerate
+            
+            # Compare totals for each series
+            for series_name in old_series.keys():
+                old_total = sum(old_series[series_name])
+                new_total = sum(new_series[series_name])
+                
+                if old_total == 0:
+                    continue  # Skip if no baseline
+                
+                change_pct = abs(new_total - old_total) / old_total
+                if change_pct > 0.10:  # >10% change
+                    logger.info(f"Significant change detected in {series_name}: {change_pct*100:.1f}%")
+                    return True
+        
+        elif chart_type in ['bar', 'line', 'pie']:
+            # For simple charts, compare y_values
+            old_values = old_chart.get('y_values', [])
+            new_values = new_chart.get('y_values', [])
+            
+            # Check if data structure changed
+            if len(old_values) != len(new_values):
+                return True  # Different data points = regenerate
+            
+            # Compare totals
+            old_total = sum(old_values)
+            new_total = sum(new_values)
+            
+            if old_total == 0:
+                return False  # No baseline, keep old summary
+            
+            change_pct = abs(new_total - old_total) / old_total
+            if change_pct > 0.10:  # >10% change
+                logger.info(f"Significant change detected: {change_pct*100:.1f}%")
+                return True
+            
+            # Check if top values changed significantly
+            if old_values and new_values:
+                old_max = max(old_values)
+                new_max = max(new_values)
+                old_max_idx = old_values.index(old_max)
+                new_max_idx = new_values.index(new_max)
+                
+                # If leader changed OR top value changed >10%
+                if old_max_idx != new_max_idx:
+                    logger.info(f"Leader changed from position {old_max_idx} to {new_max_idx}")
+                    return True
+                
+                if old_max > 0:
+                    max_change_pct = abs(new_max - old_max) / old_max
+                    if max_change_pct > 0.10:
+                        logger.info(f"Top value changed by {max_change_pct*100:.1f}%")
+                        return True
+        
+        # No significant change detected
+        return False
+        
+    except Exception as e:
+        logger.warning(f"Error checking if summary needs regeneration: {e}")
+        # On error, regenerate to be safe
+        return True
+
+def call_chart_agent_for_summary(prompt: str, trace_id: str = None) -> tuple[str, dict]:
+    Call agent ONLY for summary generation (not full chart config).
+    Returns tuple of (summary_text, token_usage_dict)
+    """
+    messages = [
+        SystemMessage(content="You are a data analyst. Analyze the chart data and provide a brief, insightful summary in 2-3 sentences."),
+        HumanMessage(content=prompt)
+    ]
+    
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    
+    config = {
+        "run_name": "summary-generation",
+        "metadata": {"trace_id": trace_id}
+    }
+    if langfuse_handler:
+        config["callbacks"] = [langfuse_handler]
+    
+    # Simple structured output for just summary
+    class SummaryOnly(BaseModel):
+        summary: str
+    
+    summary_agent = llm.with_structured_output(SummaryOnly, include_raw=True)
+    response = summary_agent.invoke(messages, config=config)
+    
+    result = response['parsed']
+    raw_response = response['raw']
+    
+    # Extract token usage
+    token_usage = {'input_tokens': 0, 'output_tokens': 0}
+    if hasattr(raw_response, 'response_metadata') and raw_response.response_metadata:
+        usage = raw_response.response_metadata.get('token_usage', {})
+        token_usage = {
+            'input_tokens': usage.get('prompt_tokens', 0),
+            'output_tokens': usage.get('completion_tokens', 0)
+        }
+    
+    logger.info("Summary generated", extra={
+        "trace_id": trace_id,
+        "summary_length": len(result.summary),
+        "tokens": token_usage
+    })
+    
+    return result.summary, token_usage
 
 # ============== WORKFLOW NODES (UPDATED WITH CONVERSATIONSUMMARYBUFFER) ==============
 
@@ -1533,6 +1953,10 @@ class Query(BaseModel):
     question: str
     session_id: Optional[str] = None
 
+class RegenerateChartRequest(BaseModel):
+    message_id: int
+    session_id: str
+
 # ============== MAIN WORKFLOW (UPDATED WITH MEMORY) ==============
 
 def run_chatbot_query(question: str, user_role: UserRole, session_id: str, trace_id: str) -> dict:
@@ -1743,6 +2167,160 @@ def process(q: Query, request: Request):
         
         return sanitize_json_data(error_response)
 
+@app.post("/regenerate-chart")
+def regenerate_chart(regenerate_request: RegenerateChartRequest, request: Request):
+    """
+    Regenerate chart with fresh data using saved SQL and chart config.
+    No need to go through full workflow - just execute SQL and rebuild chart.
+    """
+    start_time = datetime.now()
+    trace_id = getattr(request.state, 'trace_id', str(uuid.uuid4()))
+    
+    logger.info(f"Regenerating chart for message {regenerate_request.message_id}", extra={
+        "trace_id": trace_id,
+        "message_id": regenerate_request.message_id,
+        "session_id": regenerate_request.session_id
+    })
+    
+    try:
+        # 1. Fetch message from database
+        conn = get_postgres_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        cur.execute("""
+            SELECT 
+                cm.filtered_sql,
+                cm.chart_data,
+                cm.langfuse_trace_id,
+                cm.created_at
+            FROM chat_messages cm
+            WHERE cm.message_id = %s AND cm.session_id = %s
+        """, (regenerate_request.message_id, regenerate_request.session_id))
+        
+        message = cur.fetchone()
+        cur.close()
+        release_postgres_conn(conn)
+        
+        if not message:
+            logger.error(f"Message not found: {regenerate_request.message_id}")
+            raise HTTPException(status_code=404, detail="Message not found")
+        
+        saved_filtered_sql = message['filtered_sql']
+        saved_chart_config = message['chart_data']
+        
+        if not saved_filtered_sql:
+            logger.error(f"No SQL found for message {regenerate_request.message_id}")
+            raise HTTPException(status_code=400, detail="No SQL found for this message")
+        
+        if not saved_chart_config:
+            logger.error(f"No chart config found for message {regenerate_request.message_id}")
+            raise HTTPException(status_code=400, detail="No chart config found for this message")
+        
+        # 2. Execute saved SQL with fresh data
+        logger.info(f"Executing saved SQL", extra={
+            "trace_id": trace_id,
+            "sql_preview": saved_filtered_sql[:100]
+        })
+        
+        clickhouse_client = get_clickhouse_db()
+        result = clickhouse_client.query(saved_filtered_sql)
+        rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
+        fresh_data = sanitize_json_data(rows)
+        
+        logger.info(f"Query executed successfully", extra={
+            "trace_id": trace_id,
+            "row_count": len(fresh_data)
+        })
+        
+        if not fresh_data:
+            logger.warning(f"No data returned from query")
+            return {
+                "is_success": False,
+                "message": "No data available for this query",
+                "data": None
+            }
+        
+        # 3. Rebuild chart structure with fresh data
+        fresh_chart = rebuild_chart_from_config(
+            data=fresh_data,
+            config=saved_chart_config
+        )
+        
+        # 4. Smart conditional summary regeneration
+        # Check if data changed significantly (>10%)
+        needs_new_summary = should_regenerate_summary(saved_chart_config, fresh_chart)
+        
+        summary_tokens = {"input_tokens": 0, "output_tokens": 0}
+        
+        if needs_new_summary:
+            # Data changed significantly (>10%) - regenerate summary with agent
+            logger.info("Data changed significantly - regenerating summary with agent")
+            
+            summary_prompt = f"""
+Analyze this chart data and provide a brief 2-3 sentence summary:
+
+Chart Type: {fresh_chart['chart_type']}
+Title: {fresh_chart['title']}
+Data Points: {len(fresh_chart.get('x_values', []))}
+Data: {fresh_chart}
+
+Provide insights about trends, patterns, and key takeaways.
+"""
+            
+            summary_text, summary_tokens = call_chart_agent_for_summary(
+                summary_prompt,
+                trace_id
+            )
+            fresh_chart['summary'] = summary_text
+            logger.info(f"Summary regenerated using agent (tokens: {summary_tokens})")
+        else:
+            # Data changed minimally (<10%) - update numbers in old summary WITHOUT agent
+            logger.info("Data changed minimally - updating numbers in summary (no agent)")
+            old_summary = saved_chart_config.get('summary', '')
+            updated_summary = update_summary_numbers(old_summary, saved_chart_config, fresh_chart)
+            fresh_chart['summary'] = updated_summary
+            logger.info(f"Summary numbers updated without agent")
+        
+        duration = (datetime.now() - start_time).total_seconds()
+        
+        logger.info(f"Chart regenerated successfully in {duration:.2f}s", extra={
+            "trace_id": trace_id,
+            "chart_type": fresh_chart['chart_type'],
+            "execution_time": duration,
+            "summary_regenerated": needs_new_summary
+        })
+        
+        # 5. Return fresh chart (don't save to DB)
+        return {
+            "is_success": True,
+            "message": "Chart regenerated successfully",
+            "data": {
+                "chart_data": fresh_chart,
+                "data": fresh_data,
+                "regenerated_at": datetime.now().isoformat(),
+                "original_created_at": message['created_at'].isoformat(),
+                "execution_time": f"{duration:.2f}s",
+                "tokens_used": summary_tokens,
+                "summary_regenerated": needs_new_summary  # Let frontend know if summary changed
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        logger.error(f"Chart regeneration failed: {e}", extra={
+            "trace_id": trace_id,
+            "message_id": regenerate_request.message_id,
+            "error": str(e),
+            "execution_time": duration
+        })
+        return {
+            "is_success": False,
+            "message": f"Regeneration failed: {str(e)}",
+            "data": None
+        }
+
 # ============== SESSION MANAGEMENT ENDPOINTS (UPDATED) ==============
 
 @app.get("/sessions")
@@ -1847,10 +2425,10 @@ def get_session_info(session_id: str):
         
         # Get all messages with rich metadata including tokens
         cur.execute("""
-            SELECT cm.role, cm.content, cm.sql_query, cm.filtered_sql, cm.chart_data, 
+            SELECT cm.message_id, cm.role, cm.content, cm.sql_query, cm.filtered_sql, cm.chart_data, 
                    cm.result_data, cm.execution_time, cm.error, cm.langfuse_trace_id, 
                    cm.input_tokens, cm.output_tokens, cm.created_at, cs.session_status,
-                   cm.created_at,cm.updated_at
+                   cm.updated_at
             FROM chat_messages cm
             JOIN chat_sessions cs ON cm.session_id = cs.session_id
             WHERE cm.session_id = %s 
@@ -1876,9 +2454,10 @@ def get_session_info(session_id: str):
                 if row.get("filtered_sql"):
                     msg["filtered_sql"] = row["filtered_sql"]
                 if row.get("chart_data"):
-                    msg["chart_data"] = row["chart_data"]  # Already parsed from JSONB
-                if row.get("result_data"):
-                    msg["data"] = row["result_data"]  # Already parsed from JSONB
+                    msg["chart_data"] = row["chart_data"]  # Only structure, no data
+                    msg["needs_regeneration"] = True  # Flag for frontend
+                    msg["message_id"] = row["message_id"]  # For regenerate API call
+                # Note: result_data is no longer saved, so we don't return it
                 if row.get("execution_time"):
                     msg["execution_time"] = row["execution_time"]
                 if row.get("error"):

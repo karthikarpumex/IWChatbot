@@ -28,6 +28,61 @@ if "session_loaded" not in st.session_state:
 if "new_chat_started" not in st.session_state:
     st.session_state.new_chat_started = False
 
+# Initialize regenerated charts state (stores fresh data for regenerated charts)
+if "regenerated_charts" not in st.session_state:
+    st.session_state.regenerated_charts = {}
+
+# Initialize regenerating state (tracks which charts are currently regenerating)
+if "regenerating_charts" not in st.session_state:
+    st.session_state.regenerating_charts = {}
+
+def regenerate_chart(message_id, session_id, message_index):
+    """Regenerate chart with fresh data from backend"""
+    try:
+        # Mark as regenerating using message_id
+        st.session_state.regenerating_charts[message_id] = True
+        
+        payload = {
+            "message_id": message_id,
+            "session_id": session_id
+        }
+        
+        response = requests.post(
+            f"{BACKEND_URL}/regenerate-chart",
+            json=payload,
+            timeout=60
+        )
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            
+            if response_data.get("is_success") and response_data.get("data"):
+                data = response_data["data"]
+                
+                # Store regenerated chart data by message_id (not index!)
+                st.session_state.regenerated_charts[message_id] = {
+                    "chart_data": data.get("chart_data"),
+                    "data": data.get("data"),
+                    "regenerated_at": data.get("regenerated_at"),
+                    "execution_time": data.get("execution_time")
+                }
+                
+                st.success(f"✅ Chart regenerated in {data.get('execution_time', 'N/A')}")
+                return True
+            else:
+                st.error(f"Failed to regenerate: {response_data.get('message', 'Unknown error')}")
+                return False
+        else:
+            st.error(f"Server error: {response.status_code}")
+            return False
+            
+    except Exception as e:
+        st.error(f"Regeneration error: {str(e)}")
+        return False
+    finally:
+        # Clear regenerating state
+        st.session_state.regenerating_charts[message_id] = False
+
 # Load conversation history from backend on first load
 def load_session_from_backend(session_id):
     """Load conversation history from backend database"""
@@ -66,6 +121,11 @@ def load_session_from_backend(session_id):
                                 assistant_msg["data"] = msg["data"]
                             if msg.get("execution_time"):
                                 assistant_msg["execution_time"] = msg["execution_time"]
+                            
+                            # IMPORTANT: Capture regeneration metadata
+                            if msg.get("needs_regeneration"):
+                                assistant_msg["needs_regeneration"] = True
+                                assistant_msg["message_id"] = msg.get("message_id")
                                 
                             messages.append(assistant_msg)
                         # Skip "summary" type messages for display
@@ -267,7 +327,22 @@ for i, message in enumerate(st.session_state.chat_messages):
             st.write(message["content"])
     else:
         with st.chat_message("assistant"):
-            chart_data = message.get("chart_data")
+            # Get message_id for this message (if available)
+            message_id = message.get("message_id")
+            
+            # Check if this chart has been regenerated (use message_id, not index!)
+            regenerated = st.session_state.regenerated_charts.get(message_id) if message_id else None
+            
+            # Use regenerated data if available, otherwise use original
+            if regenerated:
+                chart_data = regenerated["chart_data"]
+                message_data = regenerated["data"]
+                is_regenerated = True
+            else:
+                chart_data = message.get("chart_data")
+                message_data = message.get("data")
+                is_regenerated = False
+            
             summary = chart_data.get("summary") if chart_data else None
             chart_type = chart_data.get("chart_type") if chart_data else None
 
@@ -286,13 +361,35 @@ for i, message in enumerate(st.session_state.chat_messages):
                         break
             if summary and show_summary:
                 st.write(summary)
+            
+            # Show regeneration badge if chart was regenerated
+            if is_regenerated:
+                st.success(f"🔄 Regenerated with current data ({regenerated['execution_time']})")
 
-            if chart_data and chart_type:
+            # Check if chart needs regeneration (no data loaded yet)
+            needs_regeneration = message.get("needs_regeneration", False) and not is_regenerated
+            
+            if needs_regeneration and chart_data and message_id:
+                # Show chart placeholder with regenerate button
+                st.info(f"📊 **{chart_data.get('title', 'Chart')}**\n\nChart data not loaded. Click to regenerate with current data.")
+                
+                is_regenerating = st.session_state.regenerating_charts.get(message_id, False)
+                
+                if st.button(
+                    "🔄 Regenerate Chart" if not is_regenerating else "⏳ Regenerating...",
+                    key=f"regenerate_{message_id}",
+                    disabled=is_regenerating,
+                    use_container_width=True
+                ):
+                    with st.spinner("Regenerating chart with fresh data..."):
+                        if regenerate_chart(message_id, st.session_state.session_id, i):
+                            st.rerun()
+            elif chart_data and chart_type:
                 try:
                     if chart_type == "table":
                         st.subheader(chart_data.get("title", "Data Table"))
-                        if message.get("data"):
-                            df = pd.DataFrame(message["data"])
+                        if message_data:
+                            df = pd.DataFrame(message_data)
                             st.dataframe(df, use_container_width=True, height=400)
                             csv = df.to_csv(index=False)
                             st.download_button(
@@ -300,7 +397,7 @@ for i, message in enumerate(st.session_state.chat_messages):
                                 csv,
                                 f"{chart_data.get('title', 'data').replace(' ', '_').lower()}.csv",
                                 "text/csv",
-                                key=f"table_download_{id(message)}"
+                                key=f"table_download_{i}_{id(message)}"
                             )
                     elif chart_type == "multi_line":
                         series_data = chart_data.get("series_data", {})
