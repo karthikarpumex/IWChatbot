@@ -63,7 +63,7 @@ def regenerate_chart(message_id, session_id, message_index):
                 st.session_state.regenerated_charts[message_id] = {
                     "chart_data": data.get("chart_data"),
                     "data": data.get("data"),
-                    "regenerated_at": data.get("regenerated_at"),
+                    "updated_at": data.get("updated_at"),
                     "execution_time": data.get("execution_time")
                 }
                 
@@ -201,20 +201,6 @@ with st.sidebar:
     new_chat_clicked = st.button("💬 New Chat", type="primary", use_container_width=True)
     
     if new_chat_clicked:
-        # Save current conversation if it has messages
-        if st.session_state.chat_messages:
-            # Get title from first user message
-            first_user_msg = next((msg["content"] for msg in st.session_state.chat_messages if msg.get("role") == "user"), "New Conversation")
-            title = first_user_msg[:50] + "..." if len(first_user_msg) > 50 else first_user_msg
-            
-            # Save to history
-            st.session_state.conversation_history.append({
-                "id": st.session_state.session_id,
-                "title": title,
-                "messages": st.session_state.chat_messages.copy(),
-                "timestamp": f"{len(st.session_state.conversation_history) + 1}"
-            })
-        
         # Start new conversation
         st.session_state.chat_messages = []
         st.session_state.session_id = str(uuid.uuid4())
@@ -234,8 +220,8 @@ with st.sidebar:
     available_sessions = get_available_sessions()
     
     if available_sessions:
-        st.markdown("### 🗂️ Recent Sessions")
-        for session in available_sessions[:5]:  # Show last 5 sessions
+        st.markdown("### 🗂️ Recent Chats")
+        for session in available_sessions[:20]:  # Show last 20 sessions
             session_id = session["session_id"]
             title = session.get("first_question", "New Conversation")
             msg_count = session.get("message_count", 0)
@@ -271,49 +257,6 @@ with st.sidebar:
                             # Force immediate refresh
                             st.rerun()
     
-    st.divider()
-    
-    # Conversation History
-    if st.session_state.conversation_history:
-        st.markdown("### Recent Chats")
-        
-        # Remove duplicates and show last 5 conversations
-        seen_ids = set()
-        unique_conversations = []
-        for conv in reversed(st.session_state.conversation_history):
-            if conv['id'] not in seen_ids:
-                seen_ids.add(conv['id'])
-                unique_conversations.append(conv)
-            if len(unique_conversations) >= 5:
-                break
-        
-        for i, conv in enumerate(unique_conversations):
-            if st.button(f"📝 {conv['title']}", key=f"load_conv_{i}_{conv['id']}", use_container_width=True):
-                # Save current conversation before switching if it has messages
-                if st.session_state.chat_messages and st.session_state.session_id != conv['id']:
-                    first_user_msg = next((msg["content"] for msg in st.session_state.chat_messages if msg.get("role") == "user"), "New Conversation")
-                    title = first_user_msg[:50] + "..." if len(first_user_msg) > 50 else first_user_msg
-                    
-                    # Update or add current conversation
-                    existing_conv = next((c for c in st.session_state.conversation_history if c['id'] == st.session_state.session_id), None)
-                    if existing_conv:
-                        existing_conv['messages'] = st.session_state.chat_messages.copy()
-                        existing_conv['title'] = title
-                    else:
-                        st.session_state.conversation_history.append({
-                            "id": st.session_state.session_id,
-                            "title": title,
-                            "messages": st.session_state.chat_messages.copy(),
-                            "timestamp": f"{len(st.session_state.conversation_history) + 1}"
-                        })
-                
-                # Load selected conversation
-                st.session_state.chat_messages = conv['messages'].copy()
-                st.session_state.session_id = conv['id']
-                st.session_state.current_conversation_title = conv['title']
-                st.rerun()
-        
-        st.divider()
 
 st.title("📊 IronWorker Chatbot")
 
@@ -337,13 +280,14 @@ for i, message in enumerate(st.session_state.chat_messages):
             if regenerated:
                 chart_data = regenerated["chart_data"]
                 message_data = regenerated["data"]
+                summary = chart_data.get("summary") or message.get("content") # Use regenerated summary if in chart_data
                 is_regenerated = True
             else:
                 chart_data = message.get("chart_data")
                 message_data = message.get("data")
+                summary = message.get("content") or (chart_data.get("summary") if chart_data else None)
                 is_regenerated = False
             
-            summary = chart_data.get("summary") if chart_data else None
             chart_type = chart_data.get("chart_type") if chart_data else None
 
             # Show summary unless it's a 'no chart needed' message and no chart is shown

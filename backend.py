@@ -286,19 +286,18 @@ def save_to_permanent_storage(
         # Convert role from old format to new format
         role = 'user' if message_type == 'human' else 'assistant' if message_type == 'ai' else message_type
         
-        # Convert chart data to JSON string - save STRUCTURE ONLY (no data)
+        # Convert chart data to JSON string - save STRUCTURE + STATS (no raw data)
         if chart_data:
             # Extract series config from chart and data
             series_config = extract_series_config(chart_data, result_data) if result_data else None
             
-            # Save only chart structure (no x_values, y_values, series_data)
+            # Save only chart structure + metrics (no heavy x_values, y_values, series_data)
             chart_structure = {
                 'chart_type': chart_data.get('chart_type'),
                 'title': chart_data.get('title'),
                 'x_label': chart_data.get('x_label'),
                 'y_label': chart_data.get('y_label'),
-                'summary': chart_data.get('summary'),
-                'series_config': series_config  # Metadata for regeneration
+                'series_config': series_config
             }
             chart_json = json.dumps(chart_structure)
         else:
@@ -312,12 +311,15 @@ def save_to_permanent_storage(
             (session_id, role, content, sql_query, filtered_sql, chart_data, result_data,
              execution_time, error, langfuse_trace_id, input_tokens, output_tokens) 
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING message_id
         """, (session_id, role, content, sql_query, filtered_sql, chart_json, result_json,
               execution_time, error, langfuse_trace_id, input_tokens, output_tokens))
         
+        message_id = cur.fetchone()[0]
         conn.commit()
         cur.close()
-        logger.debug(f"Saved {role} message with tokens=({input_tokens},{output_tokens}) trace={langfuse_trace_id} for session {session_id}")
+        logger.debug(f"Saved {role} message ID={message_id} with tokens=({input_tokens},{output_tokens}) trace={langfuse_trace_id} for session {session_id}")
+        return message_id
         
     except Exception as e:
         logger.error(f"Error in save_to_permanent_storage for session {session_id}: {e}", extra={
@@ -1226,6 +1228,80 @@ def call_chart_agent(prompt: str, trace_id: str = None) -> tuple[ChartData, dict
     
     return result, token_usage
 
+def call_chart_agent_for_regeneration(
+    question: str, 
+    data: list, 
+    old_config: dict, 
+    old_summary: str, 
+    trace_id: str = None
+) -> tuple[ChartData, dict]:
+    """
+    Specialized chart agent call for regeneration.
+    Uses old configuration and summary as context to ensure consistency.
+    """
+    columns = list(data[0].keys()) if data else []
+    
+    agent_prompt = f"""
+USER ORIGINAL QUESTION: {question}
+
+PREVIOUS CHART CONFIGURATION:
+- Chart Type: {old_config.get('chart_type')}
+- Title: {old_config.get('title')}
+- X-Label: {old_config.get('x_label')}
+- Y-Label: {old_config.get('y_label')}
+- Series Config: {old_config.get('series_config')}
+
+PREVIOUS SUMMARY:
+{old_summary}
+
+FRESH DATA INFO:
+- Columns: {columns}
+- Total rows: {len(data)}
+- Full dataset (sample): {data[:100]}
+
+TASK:
+1. Regenerate the chart using this FRESH DATA.
+2. Maintain the SAME STYLE and FOCUS as the previous chart (keep chart_type, x_label, y_label if still appropriate).
+3. Update the SUMMARY to reflect the new numbers while keeping the same tone and insights.
+4. Ensure data consistency and limit to top 15 categories for readability.
+"""
+
+    messages = [
+        SystemMessage(content=CHART_SYSTEM_PROMPT),
+        HumanMessage(content=agent_prompt)
+    ]
+    
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    
+    config = {
+        "run_name": "chart-regeneration-agent",
+        "metadata": {"trace_id": trace_id}
+    }
+    if langfuse_handler:
+        config["callbacks"] = [langfuse_handler]
+    
+    chart_agent = llm.with_structured_output(ChartData, include_raw=True)
+    response = chart_agent.invoke(messages, config=config)
+    
+    result = response['parsed']
+    raw_response = response['raw']
+    
+    token_usage = {'input_tokens': 0, 'output_tokens': 0}
+    if hasattr(raw_response, 'response_metadata') and raw_response.response_metadata:
+        usage = raw_response.response_metadata.get('token_usage', {})
+        token_usage = {
+            'input_tokens': usage.get('prompt_tokens', 0),
+            'output_tokens': usage.get('completion_tokens', 0)
+        }
+
+    logger.info("Chart regenerated via Agent", extra={
+        "trace_id": trace_id, 
+        "chart_type": result.chart_type,
+        "tokens": token_usage
+    })
+    
+    return result, token_usage
+
 # ============== HELPER FUNCTIONS ==============
 
 def sanitize_json_data(obj):
@@ -1342,313 +1418,6 @@ def extract_series_config(chart_data: dict, raw_data: list[dict]) -> dict | None
     
     return None
 
-def rebuild_chart_from_config(data: list[dict], config: dict) -> dict:
-    """
-    Rebuild chart using saved config + fresh data.
-    Returns chart WITHOUT summary (summary added separately).
-    """
-    chart_type = config.get('chart_type')
-    series_config = config.get('series_config')
-    
-    if chart_type == 'multi_line' and series_config:
-        x_col = series_config.get('x_column')
-        series_col = series_config.get('series_column')
-        y_col = series_config.get('y_column')
-        
-        # Validate that we have the required columns
-        if not all([x_col, series_col, y_col]):
-            logger.error(f"Missing required columns in series_config: {series_config}")
-            raise ValueError(f"Invalid series configuration: missing columns")
-        
-        # Get unique x values and series names
-        x_values = sorted(set(str(row[x_col]) for row in data if x_col in row))
-        series_names = sorted(set(str(row[series_col]) for row in data if series_col in row))
-        
-        # Initialize series_data
-        series_data = {}
-        for series_name in series_names:
-            # Format series name nicely
-            if series_col == 'localunionid':
-                formatted_name = f"Local {series_name}"
-            else:
-                formatted_name = series_name
-            series_data[formatted_name] = []
-        
-        # Fill in values for each x_value
-        for x_val in x_values:
-            for series_name in series_names:
-                # Find matching row
-                matching_row = next(
-                    (row for row in data 
-                     if str(row.get(x_col, '')) == x_val and str(row.get(series_col, '')) == series_name),
-                    None
-                )
-                
-                # Format series name for lookup
-                if series_col == 'localunionid':
-                    formatted_name = f"Local {series_name}"
-                else:
-                    formatted_name = series_name
-                
-                if matching_row and y_col in matching_row:
-                    try:
-                        # Try to convert to float
-                        y_value = matching_row[y_col]
-                        if isinstance(y_value, (int, float, Decimal)):
-                            series_data[formatted_name].append(float(y_value))
-                        else:
-                            # If not numeric, log error and use 0
-                            logger.warning(f"Non-numeric value in y_column '{y_col}': {y_value} (type: {type(y_value).__name__})")
-                            series_data[formatted_name].append(0)
-                    except (ValueError, TypeError) as e:
-                        logger.error(f"Failed to convert y_value to float: {matching_row.get(y_col)} - {e}")
-                        series_data[formatted_name].append(0)
-                else:
-                    series_data[formatted_name].append(0)
-        
-        return {
-            "chart_type": "multi_line",
-            "title": config.get('title', ''),
-            "x_label": config.get('x_label', ''),
-            "y_label": config.get('y_label', ''),
-            "x_values": x_values,
-            "series_data": series_data,
-        }
-    
-    elif chart_type in ['bar', 'line', 'pie'] and series_config:
-        x_col = series_config.get('x_column')
-        y_col = series_config.get('y_column')
-        
-        if not all([x_col, y_col]):
-            logger.error(f"Missing required columns in series_config: {series_config}")
-            raise ValueError(f"Invalid series configuration: missing columns")
-        
-        x_values = []
-        y_values = []
-        
-        for row in data:
-            if x_col in row and y_col in row:
-                x_values.append(str(row[x_col]))
-                try:
-                    y_value = row[y_col]
-                    if isinstance(y_value, (int, float, Decimal)):
-                        y_values.append(float(y_value))
-                    else:
-                        logger.warning(f"Non-numeric value in y_column '{y_col}': {y_value}")
-                        y_values.append(0)
-                except (ValueError, TypeError) as e:
-                    logger.error(f"Failed to convert y_value to float: {row.get(y_col)} - {e}")
-                    y_values.append(0)
-        
-        return {
-            "chart_type": chart_type,
-            "title": config.get('title', ''),
-            "x_label": config.get('x_label', ''),
-            "y_label": config.get('y_label', ''),
-            "x_values": x_values,
-            "y_values": y_values,
-        }
-    
-    else:
-        # Table or other types - return basic structure
-        return {
-            "chart_type": chart_type,
-            "title": config.get('title', ''),
-            "x_label": config.get('x_label', ''),
-            "y_label": config.get('y_label', ''),
-        }
-
-def update_summary_numbers(old_summary: str, old_chart: dict, new_chart: dict) -> str:
-    """
-    Update numbers in summary to match fresh data without calling agent.
-    Preserves original phrasing, just updates the values.
-    
-    Example:
-    Old: "Caleb Redman leads with 137 courses"
-    New: "Caleb Redman leads with 139 courses"
-    """
-    import re
-    
-    try:
-        updated_summary = old_summary
-        chart_type = old_chart.get('chart_type')
-        
-        if chart_type in ['bar', 'line', 'pie']:
-            # For simple charts, replace y_values
-            old_values = old_chart.get('y_values', [])
-            new_values = new_chart.get('y_values', [])
-            old_x_values = old_chart.get('x_values', [])
-            new_x_values = new_chart.get('x_values', [])
-            
-            if len(old_values) == len(new_values):
-                # Create a mapping of old value → new value
-                value_map = {}
-                for i, (old_val, new_val) in enumerate(zip(old_values, new_values)):
-                    if old_val != new_val:
-                        value_map[old_val] = new_val
-                
-                # Replace each old value with new value in summary
-                for old_val, new_val in value_map.items():
-                    # Format numbers consistently (remove decimals if .0)
-                    old_str = str(int(old_val)) if old_val == int(old_val) else str(old_val)
-                    new_str = str(int(new_val)) if new_val == int(new_val) else str(new_val)
-                    
-                    # Replace the number (with word boundaries to avoid partial matches)
-                    pattern = r'\b' + re.escape(old_str) + r'\b'
-                    updated_summary = re.sub(pattern, new_str, updated_summary)
-                    
-                    logger.info(f"Updated summary: {old_str} → {new_str}")
-        
-        elif chart_type == 'multi_line':
-            # For multi-line charts, update series totals
-            old_series = old_chart.get('series_data', {})
-            new_series = new_chart.get('series_data', {})
-            
-            for series_name in old_series.keys():
-                if series_name in new_series:
-                    old_total = sum(old_series[series_name])
-                    new_total = sum(new_series[series_name])
-                    
-                    if old_total != new_total:
-                        old_str = str(int(old_total)) if old_total == int(old_total) else str(old_total)
-                        new_str = str(int(new_total)) if new_total == int(new_total) else str(new_total)
-                        
-                        # Replace in context of the series name
-                        # Look for patterns like "Local 377 with 120" or "377: 120"
-                        pattern = r'\b' + re.escape(old_str) + r'\b'
-                        updated_summary = re.sub(pattern, new_str, updated_summary)
-                        
-                        logger.info(f"Updated {series_name}: {old_str} → {new_str}")
-        
-        return updated_summary
-        
-    except Exception as e:
-        logger.warning(f"Failed to update summary numbers: {e}")
-        # On error, return original summary
-        return old_summary
-
-def should_regenerate_summary(old_chart: dict, new_chart: dict) -> bool:
-    """
-    Determine if summary should be regenerated based on data changes.
-    Returns True if data changed significantly (>10% change in key metrics).
-    """
-    try:
-        chart_type = old_chart.get('chart_type')
-        
-        if chart_type == 'multi_line':
-            # For multi-line charts, compare series totals
-            old_series = old_chart.get('series_data', {})
-            new_series = new_chart.get('series_data', {})
-            
-            # Check if series changed
-            if set(old_series.keys()) != set(new_series.keys()):
-                return True  # Different series = regenerate
-            
-            # Compare totals for each series
-            for series_name in old_series.keys():
-                old_total = sum(old_series[series_name])
-                new_total = sum(new_series[series_name])
-                
-                if old_total == 0:
-                    continue  # Skip if no baseline
-                
-                change_pct = abs(new_total - old_total) / old_total
-                if change_pct > 0.10:  # >10% change
-                    logger.info(f"Significant change detected in {series_name}: {change_pct*100:.1f}%")
-                    return True
-        
-        elif chart_type in ['bar', 'line', 'pie']:
-            # For simple charts, compare y_values
-            old_values = old_chart.get('y_values', [])
-            new_values = new_chart.get('y_values', [])
-            
-            # Check if data structure changed
-            if len(old_values) != len(new_values):
-                return True  # Different data points = regenerate
-            
-            # Compare totals
-            old_total = sum(old_values)
-            new_total = sum(new_values)
-            
-            if old_total == 0:
-                return False  # No baseline, keep old summary
-            
-            change_pct = abs(new_total - old_total) / old_total
-            if change_pct > 0.10:  # >10% change
-                logger.info(f"Significant change detected: {change_pct*100:.1f}%")
-                return True
-            
-            # Check if top values changed significantly
-            if old_values and new_values:
-                old_max = max(old_values)
-                new_max = max(new_values)
-                old_max_idx = old_values.index(old_max)
-                new_max_idx = new_values.index(new_max)
-                
-                # If leader changed OR top value changed >10%
-                if old_max_idx != new_max_idx:
-                    logger.info(f"Leader changed from position {old_max_idx} to {new_max_idx}")
-                    return True
-                
-                if old_max > 0:
-                    max_change_pct = abs(new_max - old_max) / old_max
-                    if max_change_pct > 0.10:
-                        logger.info(f"Top value changed by {max_change_pct*100:.1f}%")
-                        return True
-        
-        # No significant change detected
-        return False
-        
-    except Exception as e:
-        logger.warning(f"Error checking if summary needs regeneration: {e}")
-        # On error, regenerate to be safe
-        return True
-
-def call_chart_agent_for_summary(prompt: str, trace_id: str = None) -> tuple[str, dict]:
-    Call agent ONLY for summary generation (not full chart config).
-    Returns tuple of (summary_text, token_usage_dict)
-    """
-    messages = [
-        SystemMessage(content="You are a data analyst. Analyze the chart data and provide a brief, insightful summary in 2-3 sentences."),
-        HumanMessage(content=prompt)
-    ]
-    
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    
-    config = {
-        "run_name": "summary-generation",
-        "metadata": {"trace_id": trace_id}
-    }
-    if langfuse_handler:
-        config["callbacks"] = [langfuse_handler]
-    
-    # Simple structured output for just summary
-    class SummaryOnly(BaseModel):
-        summary: str
-    
-    summary_agent = llm.with_structured_output(SummaryOnly, include_raw=True)
-    response = summary_agent.invoke(messages, config=config)
-    
-    result = response['parsed']
-    raw_response = response['raw']
-    
-    # Extract token usage
-    token_usage = {'input_tokens': 0, 'output_tokens': 0}
-    if hasattr(raw_response, 'response_metadata') and raw_response.response_metadata:
-        usage = raw_response.response_metadata.get('token_usage', {})
-        token_usage = {
-            'input_tokens': usage.get('prompt_tokens', 0),
-            'output_tokens': usage.get('completion_tokens', 0)
-        }
-    
-    logger.info("Summary generated", extra={
-        "trace_id": trace_id,
-        "summary_length": len(result.summary),
-        "tokens": token_usage
-    })
-    
-    return result.summary, token_usage
-
 # ============== WORKFLOW NODES (UPDATED WITH CONVERSATIONSUMMARYBUFFER) ==============
 
 @log_node("generate_sql")
@@ -1656,11 +1425,7 @@ def generate_sql(state: State) -> State:
     """Generate SQL using ConversationSummaryBufferMemory for smart context management"""
     try:
         base_question = state['question']
-        session_id = state['session_id']
-        
-        # Initialize token tracking
-        state['total_input_tokens'] = 0
-        state['total_output_tokens'] = 0
+        session_id = state['session_id']     
         
         # Get conversation memory (with automatic summarization!)
         conv_memory = get_conversation_memory(session_id, k=10)
@@ -2076,7 +1841,7 @@ def process(q: Query, request: Request):
 
 
         # Save the AI response with execution_time to permanent storage
-        save_to_permanent_storage(
+        message_id = save_to_permanent_storage(
             session_id=session_id,
             message_type="assistant",
             content=summary,
@@ -2096,6 +1861,7 @@ def process(q: Query, request: Request):
             "is_success": True,
             "message": "success",
             "data": {
+                "message_id": message_id,
                 "session_id": session_id,
                 "trace_id": trace_id,
                 "session_status": "Completed",
@@ -2123,7 +1889,7 @@ def process(q: Query, request: Request):
         
         # Save error information to database
         try:
-            save_to_permanent_storage(
+            message_id = save_to_permanent_storage(
                 session_id=session_id,
                 message_type="assistant",
                 content=f"Error: {error_message}",
@@ -2149,6 +1915,7 @@ def process(q: Query, request: Request):
             "is_success": True,
             "message": "success",
             "data": {
+                "message_id": message_id if 'message_id' in locals() else None,
                 "session_id": session_id,
                 "trace_id": trace_id,
                 "type": "error",
@@ -2183,125 +1950,95 @@ def regenerate_chart(regenerate_request: RegenerateChartRequest, request: Reques
     })
     
     try:
-        # 1. Fetch message from database
+        # 1. Fetch all context in "One Glance" (Assistant message + Original user question)
         conn = get_postgres_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
         cur.execute("""
             SELECT 
-                cm.filtered_sql,
-                cm.chart_data,
-                cm.langfuse_trace_id,
-                cm.created_at
-            FROM chat_messages cm
-            WHERE cm.message_id = %s AND cm.session_id = %s
+                assist.sql_query,
+                assist.filtered_sql, 
+                assist.chart_data, 
+                assist.content,
+                (SELECT content FROM chat_messages 
+                 WHERE session_id = assist.session_id 
+                   AND role = 'user' 
+                   AND created_at < assist.created_at 
+                 ORDER BY created_at DESC LIMIT 1) as original_question
+            FROM chat_messages assist
+            WHERE assist.message_id = %s AND assist.session_id = %s
         """, (regenerate_request.message_id, regenerate_request.session_id))
         
-        message = cur.fetchone()
-        cur.close()
-        release_postgres_conn(conn)
+        message_with_context = cur.fetchone()
         
-        if not message:
-            logger.error(f"Message not found: {regenerate_request.message_id}")
-            raise HTTPException(status_code=404, detail="Message not found")
-        
-        saved_filtered_sql = message['filtered_sql']
-        saved_chart_config = message['chart_data']
-        
-        if not saved_filtered_sql:
-            logger.error(f"No SQL found for message {regenerate_request.message_id}")
-            raise HTTPException(status_code=400, detail="No SQL found for this message")
-        
-        if not saved_chart_config:
-            logger.error(f"No chart config found for message {regenerate_request.message_id}")
-            raise HTTPException(status_code=400, detail="No chart config found for this message")
-        
-        # 2. Execute saved SQL with fresh data
-        logger.info(f"Executing saved SQL", extra={
+        if not message_with_context:
+            cur.close()
+            release_postgres_conn(conn)
+            raise HTTPException(status_code=404, detail="Regeneration context not found")
+            
+        original_question = message_with_context['original_question'] or "Regenerate chart"
+        saved_filtered_sql = message_with_context['filtered_sql']
+        old_chart_config = message_with_context['chart_data'] or {}
+        old_summary = message_with_context['content'] or old_chart_config.get('summary', '')
+
+        logger.info(f"Regeneration context loaded.\nOriginal Question: {original_question}\nOld Summary: {old_summary}\nOld Config: {old_chart_config}", extra={
             "trace_id": trace_id,
-            "sql_preview": saved_filtered_sql[:100]
         })
         
+        if not saved_filtered_sql:
+            raise HTTPException(status_code=400, detail="No SQL found for this message")
+        
+        # 2. Execute saved SQL with fresh data
         clickhouse_client = get_clickhouse_db()
         result = clickhouse_client.query(saved_filtered_sql)
         rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
         fresh_data = sanitize_json_data(rows)
         
-        logger.info(f"Query executed successfully", extra={
-            "trace_id": trace_id,
-            "row_count": len(fresh_data)
-        })
-        
         if not fresh_data:
-            logger.warning(f"No data returned from query")
-            return {
-                "is_success": False,
-                "message": "No data available for this query",
-                "data": None
-            }
+            return {"is_success": False, "message": "No data available", "data": None}
         
-        # 3. Rebuild chart structure with fresh data
-        fresh_chart = rebuild_chart_from_config(
+        # 3. Call specialized Regeneration Agent for consistency
+        chart_result, tokens = call_chart_agent_for_regeneration(
+            question=original_question,
             data=fresh_data,
-            config=saved_chart_config
+            old_config=old_chart_config,
+            old_summary=old_summary,
+            trace_id=trace_id
         )
         
-        # 4. Smart conditional summary regeneration
-        # Check if data changed significantly (>10%)
-        needs_new_summary = should_regenerate_summary(saved_chart_config, fresh_chart)
+        new_summary = chart_result.summary
+        current_time = datetime.now()
         
-        summary_tokens = {"input_tokens": 0, "output_tokens": 0}
+        # 4. Update Database (content and updated_at ONLY as requested)
+        # Re-using the connection from earlier if we didn't close it, but let's be safe
+        # In the context of this function, we can re-open or keep open.
+        # Fixed: Closing/Re-opening is cleaner if we released it above.
+        conn = get_postgres_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE chat_messages 
+            SET content = %s, updated_at = %s 
+            WHERE message_id = %s
+        """, (new_summary, current_time, regenerate_request.message_id))
+        conn.commit()
+        cur.close()
+        release_postgres_conn(conn)
         
-        if needs_new_summary:
-            # Data changed significantly (>10%) - regenerate summary with agent
-            logger.info("Data changed significantly - regenerating summary with agent")
-            
-            summary_prompt = f"""
-Analyze this chart data and provide a brief 2-3 sentence summary:
-
-Chart Type: {fresh_chart['chart_type']}
-Title: {fresh_chart['title']}
-Data Points: {len(fresh_chart.get('x_values', []))}
-Data: {fresh_chart}
-
-Provide insights about trends, patterns, and key takeaways.
-"""
-            
-            summary_text, summary_tokens = call_chart_agent_for_summary(
-                summary_prompt,
-                trace_id
-            )
-            fresh_chart['summary'] = summary_text
-            logger.info(f"Summary regenerated using agent (tokens: {summary_tokens})")
-        else:
-            # Data changed minimally (<10%) - update numbers in old summary WITHOUT agent
-            logger.info("Data changed minimally - updating numbers in summary (no agent)")
-            old_summary = saved_chart_config.get('summary', '')
-            updated_summary = update_summary_numbers(old_summary, saved_chart_config, fresh_chart)
-            fresh_chart['summary'] = updated_summary
-            logger.info(f"Summary numbers updated without agent")
-        
+        fresh_chart = chart_result.model_dump()
         duration = (datetime.now() - start_time).total_seconds()
         
-        logger.info(f"Chart regenerated successfully in {duration:.2f}s", extra={
-            "trace_id": trace_id,
-            "chart_type": fresh_chart['chart_type'],
-            "execution_time": duration,
-            "summary_regenerated": needs_new_summary
-        })
-        
-        # 5. Return fresh chart (don't save to DB)
         return {
             "is_success": True,
-            "message": "Chart regenerated successfully",
+            "message": "Chart and summary got regenerated successfully",
             "data": {
+                "message_id": regenerate_request.message_id,
+                "session_id": regenerate_request.session_id,
+                "type": "assistant",
+                "content": new_summary,
                 "chart_data": fresh_chart,
                 "data": fresh_data,
-                "regenerated_at": datetime.now().isoformat(),
-                "original_created_at": message['created_at'].isoformat(),
-                "execution_time": f"{duration:.2f}s",
-                "tokens_used": summary_tokens,
-                "summary_regenerated": needs_new_summary  # Let frontend know if summary changed
+                "execution_time": duration,
+                "updated_at": current_time.isoformat()
             }
         }
         
@@ -2331,8 +2068,8 @@ def get_sessions(page: int = 1, page_size: int = 20, user_id: str = None):
     # Validate pagination parameters
     if page < 1:
         page = 1
-    if page_size < 1 or page_size > 2:  # Limit max page size to 100
-        page_size = 2
+    if page_size < 1 or page_size > 100:  # Limit max page size to 100
+        page_size = 20
     
     offset = (page - 1) * page_size
     
