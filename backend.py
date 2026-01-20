@@ -14,6 +14,8 @@ from psycopg2.extras import RealDictCursor
 import os
 from datetime import datetime
 from dotenv import load_dotenv
+from decimal import Decimal
+from fastapi.middleware.cors import CORSMiddleware
 
 # Disable OpenTelemetry auto-instrumentation
 #os.environ["OTEL_SDK_DISABLED"] = "true"
@@ -2350,6 +2352,20 @@ async def startup_event():
         "langfuse_enabled": langfuse_handler is not None
     })
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3001",
+        "http://localhost:3002",
+        "http://localhost:5187",
+        "http://localhost:5188",
+        "http://192.168.29.31:5187",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
@@ -2366,4 +2382,4 @@ async def shutdown_event():
 if __name__ == "__main__":
     init_connection_pools()
     init_conversation_tables()
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("backend:app", host="0.0.0.0", port=8000,reload=True)
