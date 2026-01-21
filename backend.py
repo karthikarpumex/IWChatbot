@@ -12,7 +12,7 @@ import clickhouse_connect
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from decimal import Decimal
 from fastapi.middleware.cors import CORSMiddleware
@@ -204,20 +204,34 @@ def init_conversation_tables():
     try:
         cur = conn.cursor()
         
+        # Migration: Check if message_id is integer and needs to be UUID
+        cur.execute("""
+            SELECT data_type 
+            FROM information_schema.columns 
+            WHERE table_name = 'chat_messages' AND column_name = 'message_id'
+        """)
+        res = cur.fetchone()
+        if res and res[0] == 'integer':
+            logger.info("Migrating chat_messages.message_id from integer to UUID. Dropping old table...")
+            cur.execute("DROP TABLE IF EXISTS chat_messages CASCADE")
+            # Also drop sessions to ensure clean state if ID types changed
+            cur.execute("DROP TABLE IF EXISTS chat_sessions CASCADE")
+            conn.commit()
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS chat_sessions (
                 session_id UUID PRIMARY KEY,
                 user_id VARCHAR(255) NOT NULL,
                 session_status VARCHAR(20) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_message_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                last_message_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc')
             )
         """)
         
         # Create chat_messages table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS chat_messages (
-                message_id SERIAL PRIMARY KEY,
+                message_id UUID PRIMARY KEY,
                 session_id UUID NOT NULL REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
                 role VARCHAR(20) NOT NULL,
                 content TEXT NOT NULL,
@@ -230,8 +244,8 @@ def init_conversation_tables():
                 langfuse_trace_id VARCHAR(255),
                 input_tokens INTEGER,
                 output_tokens INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                updated_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc')
             )
         """)
         
@@ -279,9 +293,9 @@ def save_to_permanent_storage(
         # Ensure session exists
         cur.execute("""
             INSERT INTO chat_sessions (session_id, user_id, last_message_at,session_status) 
-            VALUES (%s, %s, CURRENT_TIMESTAMP, %s)
+            VALUES (%s, %s, TIMEZONE('utc', CURRENT_TIMESTAMP), %s)
             ON CONFLICT (session_id) DO UPDATE SET 
-                last_message_at = CURRENT_TIMESTAMP,
+                last_message_at = TIMEZONE('utc', CURRENT_TIMESTAMP),
                 session_status = %s
         """, (session_id, user_id, session_status, session_status))
         
@@ -308,16 +322,14 @@ def save_to_permanent_storage(
         # DON'T save result_data (too large, not needed for regeneration)
         result_json = None
         
+        message_id = str(uuid.uuid4())
         cur.execute("""
             INSERT INTO chat_messages 
-            (session_id, role, content, sql_query, filtered_sql, chart_data, result_data,
+            (message_id, session_id, role, content, sql_query, filtered_sql, chart_data, result_data,
              execution_time, error, langfuse_trace_id, input_tokens, output_tokens) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING message_id
-        """, (session_id, role, content, sql_query, filtered_sql, chart_json, result_json,
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (message_id, session_id, role, content, sql_query, filtered_sql, chart_json, result_json,
               execution_time, error, langfuse_trace_id, input_tokens, output_tokens))
-        
-        message_id = cur.fetchone()[0]
         conn.commit()
         cur.close()
         logger.debug(f"Saved {role} message ID={message_id} with tokens=({input_tokens},{output_tokens}) trace={langfuse_trace_id} for session {session_id}")
@@ -565,7 +577,7 @@ def get_conversation_memory(session_id: str, k: int = 10) -> ConversationSummary
 
 def get_sql_system_prompt() -> str:
     """Generate SQL system prompt with current date context"""
-    current_date = datetime.now().strftime("%Y-%m-%d")
+    current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     
     return f"""You are an expert ClickHouse SQL query generator for the Ironworkers Union database.
 
@@ -937,7 +949,7 @@ Return a JSON object with:
 # ============== CONSTANTS ==============
 
 # Use current year for dynamic date validation
-_CURRENT_YEAR = datetime.now().year
+_CURRENT_YEAR = datetime.now(timezone.utc).year
 
 TABLE_DATES = {
     "drugtestrecords": (2015, _CURRENT_YEAR),
@@ -1721,7 +1733,7 @@ class Query(BaseModel):
     session_id: Optional[str] = None
 
 class RegenerateChartRequest(BaseModel):
-    message_id: int
+    message_id: str
     session_id: str
 
 # ============== MAIN WORKFLOW (UPDATED WITH MEMORY) ==============
@@ -1805,7 +1817,7 @@ def run_chatbot_query(question: str, user_role: UserRole, session_id: str, trace
 
 @app.post("/query")
 def process(q: Query, request: Request):
-    start_time = datetime.now()
+    start_time = datetime.now(timezone.utc)
     
     trace_id = getattr(request.state, 'trace_id', str(uuid.uuid4()))
     
@@ -1832,7 +1844,7 @@ def process(q: Query, request: Request):
     
     try:
         result = run_chatbot_query(q.question, user_role, session_id, trace_id)
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (datetime.now(timezone.utc) - start_time).total_seconds()
 
         chart_data = result['chart'].model_dump() if result['chart'] else None
 
@@ -1886,7 +1898,7 @@ def process(q: Query, request: Request):
         })
         return sanitize_json_data(response_data)
     except Exception as e:
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (datetime.now(timezone.utc) - start_time).total_seconds()
         error_message = str(e)
         
         # Save error information to database
@@ -1942,7 +1954,7 @@ def regenerate_chart(regenerate_request: RegenerateChartRequest, request: Reques
     Regenerate chart with fresh data using saved SQL and chart config.
     No need to go through full workflow - just execute SQL and rebuild chart.
     """
-    start_time = datetime.now()
+    start_time = datetime.now(timezone.utc)
     trace_id = getattr(request.state, 'trace_id', str(uuid.uuid4()))
     
     logger.info(f"Regenerating chart for message {regenerate_request.message_id}", extra={
@@ -1962,6 +1974,10 @@ def regenerate_chart(regenerate_request: RegenerateChartRequest, request: Reques
                 assist.filtered_sql, 
                 assist.chart_data, 
                 assist.content,
+                assist.langfuse_trace_id,
+                assist.input_tokens,
+                assist.output_tokens,
+                assist.created_at,
                 (SELECT content FROM chat_messages 
                  WHERE session_id = assist.session_id 
                    AND role = 'user' 
@@ -2009,7 +2025,8 @@ def regenerate_chart(regenerate_request: RegenerateChartRequest, request: Reques
         )
         
         new_summary = chart_result.summary
-        current_time = datetime.now()
+        fresh_chart = chart_result.model_dump()
+        current_time = datetime.now(timezone.utc)
         
         # 4. Update Database (content and updated_at ONLY as requested)
         # Re-using the connection from earlier if we didn't close it, but let's be safe
@@ -2019,35 +2036,47 @@ def regenerate_chart(regenerate_request: RegenerateChartRequest, request: Reques
         cur = conn.cursor()
         cur.execute("""
             UPDATE chat_messages 
-            SET content = %s, updated_at = %s 
+            SET content = %s, chart_data = %s, updated_at = %s 
             WHERE message_id = %s
-        """, (new_summary, current_time, regenerate_request.message_id))
+        """, (new_summary, json.dumps(fresh_chart), current_time, regenerate_request.message_id))
+        
+        cur.execute("""
+            UPDATE chat_sessions 
+            SET last_message_at = %s 
+            WHERE session_id = %s
+        """, (current_time, regenerate_request.session_id))
         conn.commit()
         cur.close()
         release_postgres_conn(conn)
         
-        fresh_chart = chart_result.model_dump()
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (datetime.now(timezone.utc) - start_time).total_seconds()
         
-        return {
+        return sanitize_json_data({
             "is_success": True,
-            "message": "Chart and summary got regenerated successfully",
+            "message": "success",
             "data": {
                 "message_id": regenerate_request.message_id,
                 "session_id": regenerate_request.session_id,
+                "trace_id": message_with_context.get('langfuse_trace_id'),
+                "session_status": "Completed",
                 "type": "assistant",
+                "sql_query": message_with_context.get('sql_query'),
+                "filtered_sql": saved_filtered_sql,
                 "content": new_summary,
                 "chart_data": fresh_chart,
                 "data": fresh_data,
-                "execution_time": duration,
-                "updated_at": current_time.isoformat()
+                "execution_time": f"{duration:.2f}s",
+                "input_tokens": message_with_context.get('input_tokens', 0),
+                "output_tokens": message_with_context.get('output_tokens', 0),
+                "updated_at": current_time.isoformat(),
+                "created_at": message_with_context.get('created_at').isoformat() if message_with_context.get('created_at') else None
             }
-        }
+        })
         
     except HTTPException:
         raise
     except Exception as e:
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (datetime.now(timezone.utc) - start_time).total_seconds()
         logger.error(f"Chart regeneration failed: {e}", extra={
             "trace_id": trace_id,
             "message_id": regenerate_request.message_id,
@@ -2164,7 +2193,7 @@ def get_session_info(session_id: str):
         
         # Get all messages with rich metadata including tokens
         cur.execute("""
-            SELECT cm.message_id, cm.role, cm.content, cm.sql_query, cm.filtered_sql, cm.chart_data, 
+            SELECT cm.session_id,cm.message_id, cm.role, cm.content, cm.sql_query, cm.filtered_sql, cm.chart_data, 
                    cm.result_data, cm.execution_time, cm.error, cm.langfuse_trace_id, 
                    cm.input_tokens, cm.output_tokens, cm.created_at, cs.session_status,
                    cm.updated_at
@@ -2182,6 +2211,8 @@ def get_session_info(session_id: str):
         total_session_tokens = 0
         for row in db_messages:
             msg = {
+                "message_id": row["message_id"],
+                "user_type": row["role"],
                 "type": "user" if row["role"] == "user" else "assistant" if row["role"] == "assistant" else "summary",
                 "content": row["content"]
             }
@@ -2196,6 +2227,7 @@ def get_session_info(session_id: str):
                     msg["chart_data"] = row["chart_data"]  # Only structure, no data
                     msg["needs_regeneration"] = True  # Flag for frontend
                     msg["message_id"] = row["message_id"]  # For regenerate API call
+                    msg["session_id"] = row.get("session_id")
                 # Note: result_data is no longer saved, so we don't return it
                 if row.get("execution_time"):
                     msg["execution_time"] = row["execution_time"]
